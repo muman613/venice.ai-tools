@@ -4,7 +4,7 @@ Small Python utilities for working with the Venice.ai API.
 
 ## Tools
 
-- `venice-fe.py` - PySide6 desktop chat/story-writing front end for Venice chat models.
+- `venice-story-writer.py` - PySide6 desktop chat/story-writing front end for Venice chat models.
 - `venice-ai-oneminute.py` - PySide6 desktop workflow for generating a one-minute video as four sequential 15-second Wan 2.7 image-to-video clips, then stitching them with FFmpeg.
 - `list-models.py` - Prints Venice model metadata matching Wan 2.7 from the models endpoint.
 
@@ -53,7 +53,7 @@ sudo apt install ffmpeg
 Run the story-writing GUI:
 
 ```bash
-python venice-fe.py
+python venice-story-writer.py
 ```
 
 Run the one-minute video generator:
@@ -72,4 +72,4 @@ python list-models.py
 
 - `venice-ai-oneminute.py` requires a starting reference image and writes the final output as an MP4.
 - The video generator creates four segment MP4 files before producing the final stitched video.
-- `venice-fe.py` stores no chat history automatically; use the GUI export buttons to save story text or full chat history.
+- `venice-story-writer.py` stores no chat history automatically; use the GUI export buttons to save story text or full chat history.
