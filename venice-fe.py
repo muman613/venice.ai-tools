@@ -10,7 +10,7 @@ from pathlib import Path
 import markdown
 import requests
 from PySide6.QtCore import QObject, Qt, QThread, Signal
-from PySide6.QtGui import QKeySequence, QShortcut, QTextCursor
+from PySide6.QtGui import QKeySequence, QShortcut, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -168,6 +168,11 @@ class StoryWriterWindow(QMainWindow):
         self.clear_button.clicked.connect(self.clear_story)
         self.save_story_button = QPushButton("Save Story")
         self.save_story_button.clicked.connect(self.save_story)
+        self.save_format_combo = QComboBox()
+        self.save_format_combo.addItem("TXT", "txt")
+        self.save_format_combo.addItem("MD", "md")
+        self.save_format_combo.addItem("HTML", "html")
+        self.save_format_combo.setCurrentText("MD")
         self.save_chat_button = QPushButton("Export Chat")
         self.save_chat_button.clicked.connect(self.save_full_chat)
         self.save_html_button = QPushButton("Export HTML")
@@ -202,6 +207,8 @@ class StoryWriterWindow(QMainWindow):
         buttons.addWidget(self.send_button)
         buttons.addWidget(self.clear_button)
         buttons.addStretch(1)
+        buttons.addWidget(QLabel("Save as"))
+        buttons.addWidget(self.save_format_combo)
         buttons.addWidget(self.save_story_button)
         buttons.addWidget(self.save_chat_button)
         buttons.addWidget(self.save_html_button)
@@ -406,6 +413,13 @@ class StoryWriterWindow(QMainWindow):
             output_format="html5",
         )
 
+    @classmethod
+    def markdown_plain_text(cls, text):
+        """Convert Markdown to plain text through the same rendered HTML path."""
+        document = QTextDocument()
+        document.setHtml(cls.markdown_html(text))
+        return document.toPlainText()
+
     @staticmethod
     def plain_text_html(text):
         """Escape plain text while preserving line breaks."""
@@ -517,23 +531,90 @@ class StoryWriterWindow(QMainWindow):
             self.status_label.setText("Story cleared.")
 
     def save_story(self):
-        """Save only generated responses."""
+        """Save only generated responses in the selected format."""
         if not self.conversation_history:
             QMessageBox.warning(self, "No story", "No story text to save.")
             return
 
+        file_format = self.save_format_combo.currentData()
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Save story",
             "",
-            "Text files (*.txt);;Markdown files (*.md);;All files (*)",
+            self.save_file_filter(file_format),
         )
         if not filename:
             return
 
-        story_text = "\n\n".join(entry.response for entry in self.conversation_history)
-        Path(filename).write_text(story_text, encoding="utf-8")
-        self.status_label.setText(f"Saved story to {Path(filename).name}")
+        path = self.path_with_format_suffix(Path(filename), file_format)
+        path.write_text(
+            self.story_content_for_format(file_format),
+            encoding="utf-8",
+        )
+        self.status_label.setText(f"Saved story to {path.name}")
+
+    @staticmethod
+    def save_file_filter(file_format):
+        """Return a QFileDialog filter for the selected story save format."""
+        filters = {
+            "txt": "Text files (*.txt);;All files (*)",
+            "md": "Markdown files (*.md);;All files (*)",
+            "html": "HTML files (*.html);;All files (*)",
+        }
+        return filters.get(file_format, filters["md"])
+
+    @staticmethod
+    def path_with_format_suffix(path, file_format):
+        """Apply a suffix matching the selected save format."""
+        suffixes = {
+            "txt": ".txt",
+            "md": ".md",
+            "html": ".html",
+        }
+        expected_suffix = suffixes.get(file_format, ".md")
+        if file_format == "html" and path.suffix.lower() == ".htm":
+            return path
+        if path.suffix.lower() != expected_suffix:
+            return path.with_suffix(expected_suffix)
+        return path
+
+    def story_markdown(self):
+        """Return generated responses as one Markdown document."""
+        return "\n\n---\n\n".join(entry.response for entry in self.conversation_history)
+
+    def story_html(self):
+        """Return generated responses as a styled HTML document."""
+        body = self.markdown_html(self.story_markdown())
+        return "\n".join(
+            [
+                "<!doctype html>",
+                "<html>",
+                "<head>",
+                "<meta charset=\"utf-8\">",
+                "<style>",
+                self.document_css(),
+                "</style>",
+                "</head>",
+                "<body>",
+                "<article class=\"response\">",
+                body,
+                "</article>",
+                "</body>",
+                "</html>",
+            ]
+        )
+
+    def story_plain_text(self):
+        """Return generated responses as plain text with Markdown syntax removed."""
+        return self.markdown_plain_text(self.story_markdown())
+
+    def story_content_for_format(self, file_format):
+        """Return story content converted for the selected save format."""
+        if file_format == "txt":
+            return self.story_plain_text()
+        if file_format == "html":
+            return self.story_html()
+        return self.story_markdown()
 
     def save_full_chat(self):
         """Save prompts and responses as Markdown."""
@@ -605,6 +686,7 @@ class StoryWriterWindow(QMainWindow):
         self.send_button.setEnabled(not generating)
         self.clear_button.setEnabled(not generating)
         self.save_story_button.setEnabled(not generating)
+        self.save_format_combo.setEnabled(not generating)
         self.save_chat_button.setEnabled(not generating)
         self.save_html_button.setEnabled(not generating)
         self.api_key_edit.setEnabled(not generating)
