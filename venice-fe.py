@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """PySide6 front end for writing stories with Venice AI chat models."""
 
+import html
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import markdown
 import requests
 from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QKeySequence, QShortcut, QTextCursor
@@ -35,7 +37,15 @@ API_URL = "https://api.venice.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "venice-uncensored-1-2"
 SYSTEM_PROMPT = (
     "You are a creative writing assistant. Help write engaging stories with "
-    "vivid descriptions, strong continuity, and compelling narrative momentum."
+    "vivid descriptions, strong continuity, and compelling narrative momentum.\n\n"
+    "Always return a well-formed Markdown document fragment. Use Markdown headings, "
+    "paragraphs, emphasis, block quotes, lists, and horizontal rules when they help "
+    "the document. Put a blank line between paragraphs. Do not wrap the response in "
+    "a fenced code block unless the user specifically asks for code."
+)
+MARKDOWN_EXTENSIONS = (
+    "extra",
+    "sane_lists",
 )
 MODELS = (
     "venice-uncensored-1-2",
@@ -160,6 +170,8 @@ class StoryWriterWindow(QMainWindow):
         self.save_story_button.clicked.connect(self.save_story)
         self.save_chat_button = QPushButton("Export Chat")
         self.save_chat_button.clicked.connect(self.save_full_chat)
+        self.save_html_button = QPushButton("Export HTML")
+        self.save_html_button.clicked.connect(self.save_html)
 
         self.status_label = QLabel("Ready")
         self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -192,6 +204,7 @@ class StoryWriterWindow(QMainWindow):
         buttons.addStretch(1)
         buttons.addWidget(self.save_story_button)
         buttons.addWidget(self.save_chat_button)
+        buttons.addWidget(self.save_html_button)
 
         layout = QVBoxLayout()
         layout.addWidget(settings_panel)
@@ -309,12 +322,56 @@ class StoryWriterWindow(QMainWindow):
         self.pending_prompt = ""
 
     def refresh_story_display(self):
-        """Render the conversation as Markdown in the story display."""
-        self.story_display.setMarkdown(self.display_markdown())
+        """Render the conversation as styled HTML in the story display."""
+        self.story_display.setHtml(self.display_html())
         cursor = self.story_display.textCursor()
         cursor.movePosition(QTextCursor.End)
         self.story_display.setTextCursor(cursor)
         self.story_display.ensureCursorVisible()
+
+    def display_html(self):
+        """Return a styled HTML document for the visible conversation."""
+        turns = []
+        for index, entry in enumerate(self.conversation_history, start=1):
+            turns.append(self.entry_html(index, entry))
+
+        body = "\n".join(turns) or "<p class=\"empty\">No story yet.</p>"
+
+        return "\n".join(
+            [
+                "<!doctype html>",
+                "<html>",
+                "<head>",
+                "<meta charset=\"utf-8\">",
+                "<style>",
+                self.document_css(),
+                "</style>",
+                "</head>",
+                "<body>",
+                body,
+                "</body>",
+                "</html>",
+            ]
+        )
+
+    def entry_html(self, index, entry):
+        """Return the rendered HTML for one prompt and response pair."""
+        prompt_html = self.plain_text_html(entry.prompt)
+        response_html = self.markdown_html(entry.response)
+        return "\n".join(
+            [
+                "<section class=\"turn\">",
+                f"<div class=\"turn-meta\">Turn {index} - {html.escape(entry.timestamp)}</div>",
+                "<div class=\"prompt\">",
+                "<div class=\"prompt-label\">Prompt</div>",
+                f"<blockquote>{prompt_html}</blockquote>",
+                "</div>",
+                "<article class=\"response\">",
+                response_html,
+                "</article>",
+                "</section>",
+            ]
+        )
 
     def display_markdown(self):
         """Return Markdown with prompts separated from model responses."""
@@ -339,6 +396,116 @@ class StoryWriterWindow(QMainWindow):
     def blockquote_text(text):
         """Render user prompts as Markdown block quotes."""
         return "\n".join(f"> {line}" if line else ">" for line in text.splitlines())
+
+    @staticmethod
+    def markdown_html(text):
+        """Convert model Markdown into HTML."""
+        return markdown.markdown(
+            text,
+            extensions=MARKDOWN_EXTENSIONS,
+            output_format="html5",
+        )
+
+    @staticmethod
+    def plain_text_html(text):
+        """Escape plain text while preserving line breaks."""
+        return "<br>\n".join(html.escape(line) for line in text.splitlines())
+
+    @staticmethod
+    def document_css():
+        """Return CSS for readable generated documents inside QTextBrowser."""
+        return """
+            body {
+                background: #2f3136;
+                color: #f1f3f4;
+                font-family: system-ui, sans-serif;
+                font-size: 15px;
+                line-height: 1.55;
+                margin: 18px;
+            }
+            .empty {
+                color: #aeb4bd;
+            }
+            .turn {
+                border-bottom: 1px solid #4b4f58;
+                margin-bottom: 24px;
+                padding-bottom: 18px;
+            }
+            .turn-meta {
+                color: #aeb4bd;
+                font-size: 12px;
+                margin-bottom: 10px;
+                text-transform: uppercase;
+            }
+            .prompt {
+                margin-bottom: 18px;
+            }
+            .prompt-label {
+                color: #c9d1d9;
+                font-weight: 600;
+            }
+            blockquote {
+                border-left: 3px solid #6ea8fe;
+                color: #c9d1d9;
+                margin: 10px 0 0;
+                padding-left: 12px;
+            }
+            .response h1,
+            .response h2,
+            .response h3 {
+                color: #ffffff;
+                font-weight: 700;
+                line-height: 1.2;
+                margin: 18px 0 10px;
+            }
+            .response h1 {
+                font-size: 26px;
+            }
+            .response h2 {
+                font-size: 22px;
+            }
+            .response h3 {
+                font-size: 18px;
+            }
+            .response p,
+            .response ul,
+            .response ol {
+                margin: 0 0 14px;
+            }
+            .response li {
+                margin-bottom: 5px;
+            }
+            .response hr {
+                border: 0;
+                border-top: 1px solid #5f6368;
+                margin: 20px 0;
+            }
+            .response code {
+                background: #202124;
+                border-radius: 3px;
+                color: #f8d866;
+                padding: 1px 4px;
+            }
+            .response pre {
+                background: #202124;
+                border: 1px solid #4b4f58;
+                border-radius: 4px;
+                color: #f1f3f4;
+                padding: 12px;
+            }
+            .response table {
+                border-collapse: collapse;
+                margin: 12px 0;
+            }
+            .response th,
+            .response td {
+                border: 1px solid #5f6368;
+                padding: 6px 8px;
+            }
+            .response th {
+                background: #3c4043;
+            }
+        """
 
     def clear_story(self):
         """Clear all displayed text and structured chat history."""
@@ -411,12 +578,35 @@ class StoryWriterWindow(QMainWindow):
         Path(filename).write_text("\n".join(lines), encoding="utf-8")
         self.status_label.setText(f"Exported chat to {Path(filename).name}")
 
+    def save_html(self):
+        """Export the rendered conversation as an HTML document."""
+        if not self.conversation_history:
+            QMessageBox.warning(self, "No chat", "No chat history to export.")
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export rendered HTML",
+            "",
+            "HTML files (*.html);;All files (*)",
+        )
+        if not filename:
+            return
+
+        path = Path(filename)
+        if path.suffix.lower() not in (".html", ".htm"):
+            path = path.with_suffix(".html")
+
+        path.write_text(self.display_html(), encoding="utf-8")
+        self.status_label.setText(f"Exported HTML to {path.name}")
+
     def set_generating(self, generating):
         """Enable or disable controls while a request is running."""
         self.send_button.setEnabled(not generating)
         self.clear_button.setEnabled(not generating)
         self.save_story_button.setEnabled(not generating)
         self.save_chat_button.setEnabled(not generating)
+        self.save_html_button.setEnabled(not generating)
         self.api_key_edit.setEnabled(not generating)
         self.model_combo.setEnabled(not generating)
         self.max_tokens_spin.setEnabled(not generating)
