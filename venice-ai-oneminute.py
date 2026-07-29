@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """
 Generate a one-minute Venice AI video as four sequential 15-second
-Wan 2.7 image-to-video clips.
+video clips.
 
 Workflow:
 1. Split the one-minute prompt into four prompts.
-2. Generate segment 1 from the selected reference image.
-3. Extract segment 1's final frame.
-4. Use that frame as the input image for segment 2.
-5. Repeat through segment 4.
-6. Concatenate all four MP4 files with FFmpeg.
-
-Wan 2.7 public API requirements:
-- model: wan-2-7-image-to-video
-- duration: 15s
-- resolution: 1080p
-- image_url: base64 image data URL
-- Do not send aspect_ratio.
-- Do not send audio. Native audio may already be embedded in the MP4.
+2. Generate four sequential image-to-video or text-to-video segments.
+3. In image-to-video mode, feed each segment's final frame into the next.
+4. Concatenate all four MP4 files with FFmpeg.
 """
 
 import base64
@@ -37,6 +27,7 @@ import requests
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -63,15 +54,27 @@ API_BASE_URL = "https://api.venice.ai/api/v1"
 CHAT_URL = f"{API_BASE_URL}/chat/completions"
 VIDEO_QUEUE_URL = f"{API_BASE_URL}/video/queue"
 VIDEO_RETRIEVE_URL = f"{API_BASE_URL}/video/retrieve"
+MODELS_URL = f"{API_BASE_URL}/models"
 
 SEGMENT_MODEL = os.environ.get(
     "VENICE_SEGMENT_MODEL",
     "venice-uncensored-1-2",
 ).strip()
 
-VIDEO_MODEL = "wan-2-7-image-to-video"
+IMAGE_TO_VIDEO_MODE = "image-to-video"
+TEXT_TO_VIDEO_MODE = "text-to-video"
+
+DEFAULT_IMAGE_VIDEO_MODEL = os.environ.get(
+    "VENICE_IMAGE_VIDEO_MODEL",
+    "wan-2-7-image-to-video",
+).strip()
+DEFAULT_TEXT_VIDEO_MODEL = os.environ.get(
+    "VENICE_TEXT_VIDEO_MODEL",
+    "wan-2.5-preview-text-to-video",
+).strip()
 VIDEO_DURATION = "15s"
 VIDEO_RESOLUTION = "1080p"
+VIDEO_ASPECT_RATIO = "16:9"
 
 SEGMENT_COUNT = 4
 
@@ -119,6 +122,15 @@ class Segment:
     transition_note: str = ""
 
 
+@dataclass
+class VideoModelOption:
+    """One selectable Venice video model."""
+
+    model_id: str
+    label: str
+    uncensored: bool = False
+
+
 class VeniceAPIError(RuntimeError):
     """An HTTP error returned by the Venice API."""
 
@@ -134,9 +146,233 @@ class VeniceAPIError(RuntimeError):
         )
 
 
+def model_text(model):
+    """Return searchable text for a model metadata object."""
+    return json.dumps(
+        model,
+        ensure_ascii=False,
+        sort_keys=True,
+    ).lower()
+
+
+def model_identifier(model):
+    """Return the Venice model ID from a model metadata object."""
+    if not isinstance(model, dict):
+        return ""
+
+    value = model.get("id") or model.get("model")
+    return str(value).strip() if value else ""
+
+
+def model_display_name(model):
+    """Return the human-readable model name when available."""
+    if not isinstance(model, dict):
+        return ""
+
+    model_spec = model.get("model_spec")
+    if isinstance(model_spec, dict):
+        value = model_spec.get("name")
+        if value:
+            return str(value).strip()
+
+    value = model.get("name")
+    return str(value).strip() if value else ""
+
+
+def normalize_model_list(data):
+    """Return a list from Venice's model-list response shapes."""
+    models = data.get("data", data) if isinstance(data, dict) else data
+
+    if isinstance(models, dict):
+        return list(models.values())
+
+    if isinstance(models, list):
+        return models
+
+    return []
+
+
+def is_text_to_video_model(model):
+    """Return True for video models that accept text prompts."""
+    if not isinstance(model, dict):
+        return False
+
+    model_type = str(model.get("type", "")).lower()
+    text = model_text(model)
+
+    if model_type and model_type != "video":
+        return False
+
+    text_to_video_markers = {
+        "text-to-video",
+        "text to video",
+        "text_to_video",
+        "text2video",
+        "t2v",
+    }
+
+    return any(marker in text for marker in text_to_video_markers)
+
+
+def is_image_to_video_model(model):
+    """Return True for video models that accept an input image."""
+    if not isinstance(model, dict):
+        return False
+
+    model_type = str(model.get("type", "")).lower()
+    text = model_text(model)
+
+    if model_type and model_type != "video":
+        return False
+
+    image_to_video_markers = {
+        "image-to-video",
+        "image to video",
+        "image_to_video",
+        "image2video",
+        "i2v",
+    }
+
+    return any(marker in text for marker in image_to_video_markers)
+
+
+def is_uncensored_model(model):
+    """Return True when the model metadata advertises uncensored behavior."""
+    text = model_text(model)
+    return (
+        "uncensored" in text
+        or "unrestricted" in text
+    )
+
+
+def model_option(model):
+    """Build a GUI option from model metadata."""
+    model_id = model_identifier(model)
+    name = model_display_name(model)
+    uncensored = is_uncensored_model(model)
+
+    if name and name != model_id:
+        label = f"{name} ({model_id})"
+    else:
+        label = model_id
+
+    if uncensored:
+        label = f"{label} - uncensored"
+
+    return VideoModelOption(
+        model_id=model_id,
+        label=label,
+        uncensored=uncensored,
+    )
+
+
+def extract_video_models(data, generation_mode):
+    """Extract selectable video model options from API data."""
+    if generation_mode == IMAGE_TO_VIDEO_MODE:
+        predicate = is_image_to_video_model
+        mode_label = "image-to-video"
+    else:
+        predicate = is_text_to_video_model
+        mode_label = "text-to-video"
+
+    options = [
+        model_option(model)
+        for model in normalize_model_list(data)
+        if predicate(model) and model_identifier(model)
+    ]
+
+    options.sort(
+        key=lambda option: (
+            not option.uncensored,
+            option.label.lower(),
+        )
+    )
+
+    uncensored_options = [
+        option
+        for option in options
+        if option.uncensored
+    ]
+
+    if uncensored_options:
+        return (
+            uncensored_options,
+            f"Loaded uncensored {mode_label} models.",
+        )
+
+    return (
+        options,
+        (
+            "No models were explicitly marked uncensored; "
+            f"showing {mode_label} models."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Background worker
 # ---------------------------------------------------------------------------
+
+class VeniceVideoModelsWorker(QObject):
+    """Load Venice video models outside the Qt event loop."""
+
+    finished = Signal(object, str)
+    failed = Signal(str)
+
+    def __init__(self, api_key, generation_mode):
+        super().__init__()
+        self.api_key = api_key
+        self.generation_mode = generation_mode
+
+    def run(self):
+        """Fetch current video models from Venice."""
+        try:
+            response = requests.get(
+                MODELS_URL,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Accept": "application/json",
+                },
+                params={
+                    "type": "video",
+                },
+                timeout=HTTP_TIMEOUT,
+            )
+
+            diagnostic = VeniceOneMinuteWorker.response_diagnostic(
+                response
+            )
+
+            if not response.ok:
+                raise VeniceAPIError(
+                    response.status_code,
+                    MODELS_URL,
+                    diagnostic,
+            )
+
+            data = response.json()
+            options, message = extract_video_models(
+                data,
+                self.generation_mode,
+            )
+
+            if not options:
+                raise RuntimeError(
+                    "The models API did not return any "
+                    f"{self.generation_mode} models."
+                )
+
+            self.finished.emit(options, message)
+
+        except (
+            requests.RequestException,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            self.failed.emit(
+                f"{type(exc).__name__}: {exc}"
+            )
+
 
 class VeniceOneMinuteWorker(QObject):
     """Perform API and FFmpeg work outside the Qt event loop."""
@@ -152,13 +388,17 @@ class VeniceOneMinuteWorker(QObject):
         prompt,
         source_file,
         output_file,
+        video_model,
+        generation_mode,
     ):
         super().__init__()
 
         self.api_key = api_key
         self.prompt = prompt
-        self.source_file = Path(source_file)
+        self.source_file = Path(source_file) if source_file else None
         self.output_file = Path(output_file)
+        self.video_model = video_model
+        self.generation_mode = generation_mode
         self.destination_dir = self.output_file.parent
         self.output_stem = self.output_file.stem
 
@@ -180,6 +420,15 @@ class VeniceOneMinuteWorker(QObject):
 
             self.verify_dependencies()
 
+            if (
+                self.is_image_to_video
+                and self.source_file is None
+            ):
+                raise RuntimeError(
+                    "Image-to-video mode requires a starting "
+                    "reference image."
+                )
+
             self.progress.emit(
                 0,
                 "Segmenting the one-minute prompt...",
@@ -188,7 +437,6 @@ class VeniceOneMinuteWorker(QObject):
             segments = self.segment_story()
             self.save_segments_json(segments)
 
-            # Segment 1 starts from the user-selected image.
             current_image_path = self.source_file
             segment_files = []
 
@@ -201,10 +449,6 @@ class VeniceOneMinuteWorker(QObject):
                     ),
                 )
 
-                source_data_url = self.image_to_data_url(
-                    current_image_path
-                )
-
                 output_path = (
                     self.destination_dir
                     / (
@@ -215,10 +459,16 @@ class VeniceOneMinuteWorker(QObject):
 
                 output_path.unlink(missing_ok=True)
 
+                source_data_url = None
+                if self.is_image_to_video:
+                    source_data_url = self.image_to_data_url(
+                        current_image_path
+                    )
+
                 self.generate_video_segment(
                     segment=segment,
-                    source_data_url=source_data_url,
                     output_path=output_path,
+                    source_data_url=source_data_url,
                 )
 
                 self.validate_media_file(
@@ -229,8 +479,10 @@ class VeniceOneMinuteWorker(QObject):
                 segment_files.append(output_path)
                 self.segment_ready.emit(str(output_path))
 
-                # Extract a continuation frame for the next generation.
-                if segment.number < SEGMENT_COUNT:
+                if (
+                    self.is_image_to_video
+                    and segment.number < SEGMENT_COUNT
+                ):
                     continuation_frame = (
                         self.destination_dir
                         / (
@@ -291,6 +543,11 @@ class VeniceOneMinuteWorker(QObject):
 
         finally:
             self.session.close()
+
+    @property
+    def is_image_to_video(self):
+        """Return True when using image-to-video generation."""
+        return self.generation_mode == IMAGE_TO_VIDEO_MODE
 
     # ------------------------------------------------------------------
     # Validation
@@ -468,7 +725,7 @@ class VeniceOneMinuteWorker(QObject):
                     "role": "system",
                     "content": (
                         "You create precise prompts for sequential "
-                        "image-to-video generation. Return only valid JSON "
+                        f"{self.generation_mode} generation. Return only valid JSON "
                         "without Markdown or commentary."
                     ),
                 },
@@ -499,13 +756,31 @@ class VeniceOneMinuteWorker(QObject):
 
     def segmentation_prompt(self):
         """Create the segmentation-model instruction."""
-        return f"""
-Divide the following one-minute video concept into exactly four sequential
-15-second image-to-video prompts.
-
+        if self.is_image_to_video:
+            mode_context = """
 The first segment starts from a reference image supplied separately.
 Each later segment starts from the extracted final frame of the preceding
 segment.
+""".strip()
+            mode_requirement = (
+                "Each description must work as an independent "
+                "image-to-video prompt."
+            )
+        else:
+            mode_context = (
+                "All segments are generated from text prompts only; "
+                "there is no source image."
+            )
+            mode_requirement = (
+                "Each description must work as an independent "
+                "text-to-video prompt."
+            )
+
+        return f"""
+Divide the following one-minute video concept into exactly four sequential
+15-second {self.generation_mode} prompts.
+
+{mode_context}
 
 Requirements:
 
@@ -521,8 +796,7 @@ Requirements:
    composition, lighting, pacing, and the desired ending frame.
 9. Do not request captions, subtitles, logos, watermarks, or visible text.
 10. Segment 4 must end with a satisfying final shot.
-11. Each description must work as an independent Wan 2.7
-    image-to-video prompt.
+11. {mode_requirement}
 12. Do not mention API parameters, duration fields, or source-image URLs
     inside the descriptions.
 
@@ -644,6 +918,8 @@ Original one-minute concept:
         data = [
             {
                 "segment": segment.number,
+                "mode": self.generation_mode,
+                "model": self.video_model,
                 "duration": VIDEO_DURATION,
                 "description": segment.description,
                 "transition_note": segment.transition_note,
@@ -766,21 +1042,23 @@ Original one-minute concept:
     def generate_video_segment(
         self,
         segment,
-        source_data_url,
         output_path,
+        source_data_url=None,
     ):
-        """Queue, poll, download, and save one Wan 2.7 segment."""
+        """Queue, poll, download, and save one video segment."""
         payload = {
-            "model": VIDEO_MODEL,
+            "model": self.video_model,
             "prompt": segment.description,
             "duration": VIDEO_DURATION,
             "resolution": VIDEO_RESOLUTION,
-            "image_url": source_data_url,
         }
 
-        # Deliberately omitted:
-        # - aspect_ratio: unsupported by this model
-        # - audio: native audio can already be embedded in the output
+        if self.is_image_to_video:
+            payload["image_url"] = source_data_url
+        else:
+            payload["aspect_ratio"] = VIDEO_ASPECT_RATIO
+
+        # Deliberately omitted: audio, because model support varies.
 
         queue_data = self.post_json(
             VIDEO_QUEUE_URL,
@@ -788,15 +1066,17 @@ Original one-minute concept:
         )
 
         queue_id = self.get_queue_id(queue_data)
+        queued_model = str(
+            queue_data.get("model") or self.video_model
+        )
+        queued_download_url = self.get_download_url(
+            queue_data
+        )
 
         if not queue_id:
-            immediate_url = self.get_download_url(
-                queue_data
-            )
-
-            if immediate_url:
+            if queued_download_url:
                 self.download_video(
-                    immediate_url,
+                    queued_download_url,
                     output_path,
                 )
                 return
@@ -819,6 +1099,8 @@ Original one-minute concept:
             queue_id=queue_id,
             segment=segment,
             output_path=output_path,
+            queued_model=queued_model,
+            queued_download_url=queued_download_url,
         )
 
     def poll_video_job(
@@ -826,6 +1108,8 @@ Original one-minute concept:
         queue_id,
         segment,
         output_path,
+        queued_model,
+        queued_download_url,
     ):
         """Poll Venice until a queued video is available."""
         deadline = (
@@ -834,7 +1118,7 @@ Original one-minute concept:
         )
 
         payload = {
-            "model": VIDEO_MODEL,
+            "model": queued_model,
             "queue_id": queue_id,
         }
 
@@ -997,7 +1281,10 @@ Original one-minute concept:
 
             download_url = self.get_download_url(data)
 
-            if download_url:
+            if download_url or (
+                queued_download_url
+                and status in COMPLETED_STATUSES
+            ):
                 self.progress.emit(
                     segment.number - 1,
                     (
@@ -1007,7 +1294,7 @@ Original one-minute concept:
                 )
 
                 self.download_video(
-                    download_url,
+                    download_url or queued_download_url,
                     output_path,
                 )
 
@@ -1303,6 +1590,9 @@ class OneMinuteWindow(QMainWindow):
 
         self.thread = None
         self.worker = None
+        self.model_thread = None
+        self.model_worker = None
+        self.generating = False
 
         self.api_key = os.environ.get(
             "VENICE_API_KEY",
@@ -1310,13 +1600,13 @@ class OneMinuteWindow(QMainWindow):
         ).strip()
 
         self.setWindowTitle(
-            "Venice Wan 2.7 One-Minute Video"
+            "Venice One-Minute Video"
         )
         self.resize(980, 720)
 
         self.source_file_edit = QLineEdit()
         self.source_file_edit.setPlaceholderText(
-            "Required reference image for segment 1"
+            "Required for image-to-video"
         )
 
         self.source_file_button = QPushButton(
@@ -1336,6 +1626,32 @@ class OneMinuteWindow(QMainWindow):
         )
         self.output_file_button.clicked.connect(
             self.choose_output_file
+        )
+
+        self.generation_mode_combo = QComboBox()
+        self.generation_mode_combo.addItem(
+            "Image-to-video",
+            IMAGE_TO_VIDEO_MODE,
+        )
+        self.generation_mode_combo.addItem(
+            "Text-to-video",
+            TEXT_TO_VIDEO_MODE,
+        )
+        self.generation_mode_combo.currentIndexChanged.connect(
+            self.generation_mode_changed
+        )
+
+        self.video_model_combo = QComboBox()
+        self.video_model_combo.addItem(
+            DEFAULT_IMAGE_VIDEO_MODEL,
+            DEFAULT_IMAGE_VIDEO_MODEL,
+        )
+
+        self.refresh_models_button = QPushButton(
+            "Refresh Models"
+        )
+        self.refresh_models_button.clicked.connect(
+            self.load_video_models
         )
 
         self.prompt_input = PromptEdit()
@@ -1370,7 +1686,7 @@ class OneMinuteWindow(QMainWindow):
 
         QTimer.singleShot(
             0,
-            self.ensure_api_key,
+            self.startup,
         )
 
     def build_layout(self):
@@ -1393,7 +1709,24 @@ class OneMinuteWindow(QMainWindow):
             self.output_file_button
         )
 
+        model_row = QHBoxLayout()
+        model_row.addWidget(
+            self.video_model_combo,
+            1,
+        )
+        model_row.addWidget(
+            self.refresh_models_button
+        )
+
         form = QFormLayout()
+        form.addRow(
+            "Mode",
+            self.generation_mode_combo,
+        )
+        form.addRow(
+            "Video model",
+            model_row,
+        )
         form.addRow(
             "Starting image",
             source_row,
@@ -1454,6 +1787,7 @@ class OneMinuteWindow(QMainWindow):
             }
 
             QLineEdit,
+            QComboBox,
             QTextBrowser,
             QTextEdit {
                 background: #2f3136;
@@ -1565,6 +1899,176 @@ class OneMinuteWindow(QMainWindow):
 
         return False
 
+    def startup(self):
+        """Load session prerequisites after the window is visible."""
+        self.update_source_controls()
+        if self.ensure_api_key():
+            self.load_video_models()
+
+    def selected_generation_mode(self):
+        """Return the selected generation mode."""
+        mode = self.generation_mode_combo.currentData()
+        return str(mode or IMAGE_TO_VIDEO_MODE)
+
+    def default_video_model(self):
+        """Return the default model for the selected generation mode."""
+        if self.selected_generation_mode() == TEXT_TO_VIDEO_MODE:
+            return DEFAULT_TEXT_VIDEO_MODEL
+
+        return DEFAULT_IMAGE_VIDEO_MODEL
+
+    def generation_mode_changed(self):
+        """Handle image/text video mode changes."""
+        self.video_model_combo.clear()
+        default_model = self.default_video_model()
+        self.video_model_combo.addItem(
+            default_model,
+            default_model,
+        )
+        self.update_source_controls()
+        self.load_video_models()
+
+    def update_source_controls(self):
+        """Enable source-image controls only when the mode needs them."""
+        is_image_mode = (
+            self.selected_generation_mode()
+            == IMAGE_TO_VIDEO_MODE
+        )
+
+        self.source_file_edit.setEnabled(
+            is_image_mode and not self.generating
+        )
+        self.source_file_button.setEnabled(
+            is_image_mode and not self.generating
+        )
+
+        if is_image_mode:
+            self.source_file_edit.setPlaceholderText(
+                "Required reference image for segment 1"
+            )
+        else:
+            self.source_file_edit.setPlaceholderText(
+                "Not used in text-to-video mode"
+            )
+
+    def load_video_models(self):
+        """Load current video models into the dropdown."""
+        if self.model_thread is not None:
+            return
+
+        if not self.ensure_api_key():
+            return
+
+        generation_mode = self.selected_generation_mode()
+
+        self.status_label.setText(
+            f"Loading {generation_mode} models..."
+        )
+        self.refresh_models_button.setDisabled(True)
+
+        current_model = self.selected_video_model()
+
+        self.model_thread = QThread(self)
+        self.model_worker = VeniceVideoModelsWorker(
+            self.api_key,
+            generation_mode,
+        )
+        self.model_worker.current_model = current_model
+
+        self.model_worker.moveToThread(
+            self.model_thread
+        )
+
+        self.model_thread.started.connect(
+            self.model_worker.run
+        )
+
+        self.model_worker.finished.connect(
+            self.video_models_loaded
+        )
+
+        self.model_worker.failed.connect(
+            self.video_models_failed
+        )
+
+        self.model_worker.finished.connect(
+            self.model_thread.quit
+        )
+
+        self.model_worker.failed.connect(
+            self.model_thread.quit
+        )
+
+        self.model_thread.finished.connect(
+            self.model_worker.deleteLater
+        )
+
+        self.model_thread.finished.connect(
+            self.model_thread.deleteLater
+        )
+
+        self.model_thread.finished.connect(
+            self.clear_model_worker
+        )
+
+        self.model_thread.start()
+
+    def video_models_loaded(self, options, message):
+        """Populate the video model dropdown with API results."""
+        current_model = self.selected_video_model()
+
+        self.video_model_combo.clear()
+
+        for option in options:
+            self.video_model_combo.addItem(
+                option.label,
+                option.model_id,
+            )
+
+        index = self.video_model_combo.findData(
+            current_model
+        )
+
+        if index < 0:
+            index = self.video_model_combo.findData(
+                self.default_video_model()
+            )
+
+        if index >= 0:
+            self.video_model_combo.setCurrentIndex(index)
+
+        self.status_label.setText(message)
+        self.append_log(message)
+
+    def video_models_failed(self, message):
+        """Report model-loading failures while preserving fallback model."""
+        self.status_label.setText(
+            "Could not load video models."
+        )
+        self.append_log(
+            f"Model load error: {message}"
+        )
+
+    def clear_model_worker(self):
+        """Clear model-loader references after thread termination."""
+        self.model_thread = None
+        self.model_worker = None
+        if self.thread is None:
+            self.refresh_models_button.setDisabled(False)
+
+    def selected_video_model(self):
+        """Return the selected Venice video model ID."""
+        model = self.video_model_combo.currentData()
+        if model:
+            return str(model)
+
+        return (
+            self.video_model_combo
+            .currentText()
+            .strip()
+            or self.default_video_model()
+        )
+
     def generate(self):
         """Validate input and start generation."""
         if self.thread is not None:
@@ -1582,6 +2086,9 @@ class OneMinuteWindow(QMainWindow):
             .strip()
         )
 
+        generation_mode = self.selected_generation_mode()
+        video_model = self.selected_video_model()
+
         output_file = (
             self.output_file_edit
             .text()
@@ -1591,20 +2098,18 @@ class OneMinuteWindow(QMainWindow):
         if not self.ensure_api_key():
             return
 
-        if not source_file:
+        if generation_mode == IMAGE_TO_VIDEO_MODE and not source_file:
             QMessageBox.warning(
                 self,
                 "Missing starting image",
                 (
-                    "Wan 2.7 image-to-video requires "
-                    "a starting reference image."
+                    "Image-to-video mode requires a starting "
+                    "reference image."
                 ),
             )
             return
 
-        source_path = Path(source_file)
-
-        if not source_path.is_file():
+        if source_file and not Path(source_file).is_file():
             QMessageBox.warning(
                 self,
                 "Invalid starting image",
@@ -1617,6 +2122,14 @@ class OneMinuteWindow(QMainWindow):
                 self,
                 "Missing prompt",
                 "Enter a one-minute video prompt.",
+            )
+            return
+
+        if not video_model:
+            QMessageBox.warning(
+                self,
+                "Missing video model",
+                "Choose a video model first.",
             )
             return
 
@@ -1642,21 +2155,34 @@ class OneMinuteWindow(QMainWindow):
             f"Text model: {SEGMENT_MODEL}"
         )
         self.append_log(
-            f"Video model: {VIDEO_MODEL}"
+            f"Video model: {video_model}"
         )
         self.append_log(
             f"Plan: {SEGMENT_COUNT} × {VIDEO_DURATION} "
             f"at {VIDEO_RESOLUTION}"
         )
         self.append_log(
-            "Aspect ratio: derived from source image"
+            f"Mode: {generation_mode}"
         )
+        if generation_mode == TEXT_TO_VIDEO_MODE:
+            self.append_log(
+                f"Aspect ratio: {VIDEO_ASPECT_RATIO}"
+            )
+        else:
+            self.append_log(
+                "Aspect ratio: derived from source image"
+            )
         self.append_log(
-            "Audio field: omitted; embedded native audio is preserved"
+            "Audio field: omitted; model default is used"
         )
-        self.append_log(
-            "Continuity: each segment uses the preceding final frame"
-        )
+        if generation_mode == IMAGE_TO_VIDEO_MODE:
+            self.append_log(
+                "Continuity: each segment uses the preceding final frame"
+            )
+        else:
+            self.append_log(
+                "Continuity: each segment prompt continues the previous one"
+            )
         self.append_log(
             "Starting generation..."
         )
@@ -1668,6 +2194,8 @@ class OneMinuteWindow(QMainWindow):
             prompt=prompt,
             source_file=source_file,
             output_file=str(output_path),
+            video_model=video_model,
+            generation_mode=generation_mode,
         )
 
         self.worker.moveToThread(
@@ -1772,14 +2300,13 @@ class OneMinuteWindow(QMainWindow):
         """Clear worker references after thread termination."""
         self.thread = None
         self.worker = None
+        self.update_source_controls()
 
     def set_generating(self, generating):
         """Enable or disable controls."""
-        self.generate_button.setDisabled(
-            generating
-        )
+        self.generating = generating
 
-        self.source_file_button.setDisabled(
+        self.generate_button.setDisabled(
             generating
         )
 
@@ -1787,17 +2314,27 @@ class OneMinuteWindow(QMainWindow):
             generating
         )
 
-        self.source_file_edit.setDisabled(
+        self.output_file_edit.setDisabled(
             generating
         )
 
-        self.output_file_edit.setDisabled(
+        self.generation_mode_combo.setDisabled(
             generating
+        )
+
+        self.video_model_combo.setDisabled(
+            generating
+        )
+
+        self.refresh_models_button.setDisabled(
+            generating or self.model_thread is not None
         )
 
         self.prompt_input.setDisabled(
             generating
         )
+
+        self.update_source_controls()
 
     def append_log(self, message):
         """Append a line to the status log."""
@@ -1816,6 +2353,22 @@ class OneMinuteWindow(QMainWindow):
                 "Generation in progress",
                 (
                     "Wait for video generation to finish "
+                    "before closing the application."
+                ),
+            )
+
+            event.ignore()
+            return
+
+        if (
+            self.model_thread is not None
+            and self.model_thread.isRunning()
+        ):
+            QMessageBox.warning(
+                self,
+                "Model loading in progress",
+                (
+                    "Wait for model loading to finish "
                     "before closing the application."
                 ),
             )

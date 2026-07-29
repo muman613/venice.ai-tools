@@ -71,7 +71,7 @@ class ChatEntry:
 class VeniceChatWorker(QObject):
     """Call Venice AI without blocking the Qt event loop."""
 
-    finished = Signal(str)
+    finished = Signal(str, str, object)
     failed = Signal(str)
 
     def __init__(self, api_key, model, prompt, history, max_tokens):
@@ -101,7 +101,10 @@ class VeniceChatWorker(QObject):
             )
             response.raise_for_status()
             data = response.json()
-            self.finished.emit(data["choices"][0]["message"]["content"].strip())
+            choice = data["choices"][0]
+            content = choice["message"]["content"].strip()
+            finish_reason = choice.get("finish_reason") or "unknown"
+            self.finished.emit(content, finish_reason, data.get("usage"))
         except (KeyError, IndexError, requests.RequestException, ValueError) as exc:
             self.failed.emit(str(exc))
 
@@ -149,13 +152,14 @@ class StoryWriterWindow(QMainWindow):
         self.model_combo.setCurrentText(DEFAULT_MODEL)
 
         self.max_tokens_spin = QSpinBox()
-        self.max_tokens_spin.setRange(256, 8192)
-        self.max_tokens_spin.setSingleStep(256)
-        self.max_tokens_spin.setValue(2000)
+        self.max_tokens_spin.setRange(1024, 32768)
+        self.max_tokens_spin.setSingleStep(1024)
+        self.max_tokens_spin.setValue(8192)
 
         self.story_display = QTextBrowser()
         self.story_display.setReadOnly(True)
         self.story_display.setOpenExternalLinks(True)
+        self.story_display.setPlaceholderText("The latest response will appear here.")
 
         self.prompt_input = PromptEdit()
         self.prompt_input.setAcceptRichText(False)
@@ -164,8 +168,10 @@ class StoryWriterWindow(QMainWindow):
 
         self.send_button = QPushButton("Send")
         self.send_button.clicked.connect(self.send_prompt)
-        self.clear_button = QPushButton("Clear")
-        self.clear_button.clicked.connect(self.clear_story)
+        self.clear_prompt_button = QPushButton("Clear")
+        self.clear_prompt_button.clicked.connect(self.clear_prompt)
+        self.clear_story_button = QPushButton("Clear Chat")
+        self.clear_story_button.clicked.connect(self.clear_story)
         self.save_story_button = QPushButton("Save Story")
         self.save_story_button.clicked.connect(self.save_story)
         self.save_format_combo = QComboBox()
@@ -198,14 +204,29 @@ class StoryWriterWindow(QMainWindow):
         settings_panel.setLayout(settings_form)
 
         splitter = QSplitter(Qt.Vertical)
-        splitter.addWidget(self.story_display)
-        splitter.addWidget(self.prompt_input)
-        splitter.setSizes([520, 130])
+        request_panel = QWidget()
+        request_layout = QVBoxLayout()
+        request_layout.setContentsMargins(0, 0, 0, 0)
+        request_layout.addWidget(QLabel("Request"))
+        request_layout.addWidget(self.prompt_input)
+        request_panel.setLayout(request_layout)
+
+        response_panel = QWidget()
+        response_layout = QVBoxLayout()
+        response_layout.setContentsMargins(0, 0, 0, 0)
+        response_layout.addWidget(QLabel("Response"))
+        response_layout.addWidget(self.story_display)
+        response_panel.setLayout(response_layout)
+
+        splitter.addWidget(request_panel)
+        splitter.addWidget(response_panel)
+        splitter.setSizes([190, 460])
         splitter.setChildrenCollapsible(False)
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.send_button)
-        buttons.addWidget(self.clear_button)
+        buttons.addWidget(self.clear_prompt_button)
+        buttons.addWidget(self.clear_story_button)
         buttons.addStretch(1)
         buttons.addWidget(QLabel("Save as"))
         buttons.addWidget(self.save_format_combo)
@@ -284,6 +305,7 @@ class StoryWriterWindow(QMainWindow):
             return
 
         self.pending_prompt = prompt
+        self.story_display.clear()
         self.set_generating(True)
         self.status_label.setText("Generating response...")
 
@@ -306,15 +328,30 @@ class StoryWriterWindow(QMainWindow):
         self.thread.finished.connect(self.clear_worker)
         self.thread.start()
 
-    def generation_finished(self, response):
+    def generation_finished(self, response, finish_reason, usage):
         """Record and display the generated response."""
         timestamp = datetime.now().strftime("%H:%M")
         entry = ChatEntry(timestamp, self.pending_prompt, response)
         self.conversation_history.append(entry)
-        self.refresh_story_display()
-        self.prompt_input.clear()
-        self.status_label.setText("Ready")
+        self.refresh_response_display(response)
+        self.status_label.setText(self.response_status(response, finish_reason, usage))
         self.set_generating(False)
+
+    def response_status(self, response, finish_reason, usage):
+        """Return a status message that makes length-limited responses obvious."""
+        token_text = ""
+        if isinstance(usage, dict):
+            completion_tokens = usage.get("completion_tokens")
+            if completion_tokens is not None:
+                token_text = f", {completion_tokens:,} output tokens"
+
+        if finish_reason == "length":
+            return (
+                f"Response stopped at the max token limit "
+                f"({len(response):,} chars{token_text}). Increase Max tokens or ask it to continue."
+            )
+
+        return f"Ready ({len(response):,} chars{token_text})"
 
     def generation_failed(self, message):
         """Display an API or parsing error."""
@@ -328,13 +365,36 @@ class StoryWriterWindow(QMainWindow):
         self.worker = None
         self.pending_prompt = ""
 
-    def refresh_story_display(self):
-        """Render the conversation as styled HTML in the story display."""
-        self.story_display.setHtml(self.display_html())
+    def refresh_response_display(self, response):
+        """Render the latest response as styled HTML in the response display."""
+        self.story_display.setHtml(self.response_html(response))
         cursor = self.story_display.textCursor()
-        cursor.movePosition(QTextCursor.End)
+        cursor.movePosition(QTextCursor.Start)
         self.story_display.setTextCursor(cursor)
         self.story_display.ensureCursorVisible()
+
+    def response_html(self, response):
+        """Return a styled HTML document for the latest model response."""
+        body = self.markdown_html(response) or "<p class=\"empty\">No response yet.</p>"
+
+        return "\n".join(
+            [
+                "<!doctype html>",
+                "<html>",
+                "<head>",
+                "<meta charset=\"utf-8\">",
+                "<style>",
+                self.document_css(),
+                "</style>",
+                "</head>",
+                "<body>",
+                "<article class=\"response\">",
+                body,
+                "</article>",
+                "</body>",
+                "</html>",
+            ]
+        )
 
     def display_html(self):
         """Return a styled HTML document for the visible conversation."""
@@ -521,6 +581,13 @@ class StoryWriterWindow(QMainWindow):
             }
         """
 
+    def clear_prompt(self):
+        """Clear only the request editor, preserving response and chat history."""
+        if not self.prompt_input.toPlainText().strip():
+            return
+        self.prompt_input.clear()
+        self.status_label.setText("Prompt cleared.")
+
     def clear_story(self):
         """Clear all displayed text and structured chat history."""
         if not self.conversation_history and not self.story_display.toPlainText().strip():
@@ -684,7 +751,8 @@ class StoryWriterWindow(QMainWindow):
     def set_generating(self, generating):
         """Enable or disable controls while a request is running."""
         self.send_button.setEnabled(not generating)
-        self.clear_button.setEnabled(not generating)
+        self.clear_prompt_button.setEnabled(not generating)
+        self.clear_story_button.setEnabled(not generating)
         self.save_story_button.setEnabled(not generating)
         self.save_format_combo.setEnabled(not generating)
         self.save_chat_button.setEnabled(not generating)
