@@ -24,9 +24,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -90,6 +91,9 @@ VIDEO_POLL_INTERVAL_SECONDS = float(
 )
 
 MAX_SOURCE_IMAGE_BYTES = 25 * 1024 * 1024
+SETTINGS_ORG = "VeniceAI"
+SETTINGS_APP = "OneMinuteVideo"
+RETAIN_INTERMEDIATE_FILES_KEY = "retain_intermediate_files"
 
 COMPLETED_STATUSES = {
     "COMPLETED",
@@ -390,6 +394,7 @@ class VeniceOneMinuteWorker(QObject):
         output_file,
         video_model,
         generation_mode,
+        retain_intermediate_files,
     ):
         super().__init__()
 
@@ -399,8 +404,10 @@ class VeniceOneMinuteWorker(QObject):
         self.output_file = Path(output_file)
         self.video_model = video_model
         self.generation_mode = generation_mode
+        self.retain_intermediate_files = retain_intermediate_files
         self.destination_dir = self.output_file.parent
         self.output_stem = self.output_file.stem
+        self.intermediate_files = []
 
         self.session = requests.Session()
         self.session.headers.update(
@@ -458,6 +465,7 @@ class VeniceOneMinuteWorker(QObject):
                 )
 
                 output_path.unlink(missing_ok=True)
+                self.track_intermediate_file(output_path)
 
                 source_data_url = None
                 if self.is_image_to_video:
@@ -493,6 +501,9 @@ class VeniceOneMinuteWorker(QObject):
                     )
 
                     continuation_frame.unlink(missing_ok=True)
+                    self.track_intermediate_file(
+                        continuation_frame
+                    )
 
                     self.progress.emit(
                         segment.number,
@@ -534,6 +545,8 @@ class VeniceOneMinuteWorker(QObject):
                 "final video",
             )
 
+            self.cleanup_intermediate_files()
+
             self.finished.emit(str(self.output_file))
 
         except Exception as exc:
@@ -548,6 +561,41 @@ class VeniceOneMinuteWorker(QObject):
     def is_image_to_video(self):
         """Return True when using image-to-video generation."""
         return self.generation_mode == IMAGE_TO_VIDEO_MODE
+
+    def track_intermediate_file(self, path):
+        """Track a temporary artifact for optional cleanup."""
+        path = Path(path)
+        if path not in self.intermediate_files:
+            self.intermediate_files.append(path)
+
+    def cleanup_intermediate_files(self):
+        """Delete intermediate artifacts when retention is disabled."""
+        if self.retain_intermediate_files:
+            self.progress.emit(
+                SEGMENT_COUNT,
+                "Retaining intermediate files.",
+            )
+            return
+
+        removed = 0
+        for path in self.intermediate_files:
+            try:
+                if path.exists():
+                    path.unlink()
+                    removed += 1
+            except OSError as exc:
+                self.progress.emit(
+                    SEGMENT_COUNT,
+                    (
+                        f"Could not delete intermediate file "
+                        f"{path.name}: {exc}"
+                    ),
+                )
+
+        self.progress.emit(
+            SEGMENT_COUNT,
+            f"Removed {removed} intermediate file(s).",
+        )
 
     # ------------------------------------------------------------------
     # Validation
@@ -940,6 +988,7 @@ Original one-minute concept:
             ),
             encoding="utf-8",
         )
+        self.track_intermediate_file(output_path)
 
     # ------------------------------------------------------------------
     # Image handling
@@ -1598,6 +1647,10 @@ class OneMinuteWindow(QMainWindow):
             "VENICE_API_KEY",
             "",
         ).strip()
+        self.settings = QSettings(
+            SETTINGS_ORG,
+            SETTINGS_APP,
+        )
 
         self.setWindowTitle(
             "Venice One-Minute Video"
@@ -1626,6 +1679,16 @@ class OneMinuteWindow(QMainWindow):
         )
         self.output_file_button.clicked.connect(
             self.choose_output_file
+        )
+
+        self.retain_intermediate_checkbox = QCheckBox(
+            "Retain intermediate files"
+        )
+        self.retain_intermediate_checkbox.setChecked(
+            self.load_retain_intermediate_files()
+        )
+        self.retain_intermediate_checkbox.stateChanged.connect(
+            self.save_retain_intermediate_files
         )
 
         self.generation_mode_combo = QComboBox()
@@ -1734,6 +1797,10 @@ class OneMinuteWindow(QMainWindow):
         form.addRow(
             "Output MP4",
             output_row,
+        )
+        form.addRow(
+            "",
+            self.retain_intermediate_checkbox,
         )
 
         button_row = QHBoxLayout()
@@ -1898,6 +1965,31 @@ class OneMinuteWindow(QMainWindow):
         )
 
         return False
+
+    def load_retain_intermediate_files(self):
+        """Return the persisted intermediate-file retention setting."""
+        value = self.settings.value(
+            RETAIN_INTERMEDIATE_FILES_KEY,
+            False,
+        )
+
+        if isinstance(value, bool):
+            return value
+
+        return str(value).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def save_retain_intermediate_files(self, *_args):
+        """Persist the intermediate-file retention setting."""
+        self.settings.setValue(
+            RETAIN_INTERMEDIATE_FILES_KEY,
+            self.retain_intermediate_checkbox.isChecked(),
+        )
+        self.settings.sync()
 
     def startup(self):
         """Load session prerequisites after the window is visible."""
@@ -2088,6 +2180,9 @@ class OneMinuteWindow(QMainWindow):
 
         generation_mode = self.selected_generation_mode()
         video_model = self.selected_video_model()
+        retain_intermediate_files = (
+            self.retain_intermediate_checkbox.isChecked()
+        )
 
         output_file = (
             self.output_file_edit
@@ -2184,6 +2279,14 @@ class OneMinuteWindow(QMainWindow):
                 "Continuity: each segment prompt continues the previous one"
             )
         self.append_log(
+            "Intermediate files: "
+            + (
+                "retained"
+                if retain_intermediate_files
+                else "removed after final MP4 is saved"
+            )
+        )
+        self.append_log(
             "Starting generation..."
         )
 
@@ -2196,6 +2299,7 @@ class OneMinuteWindow(QMainWindow):
             output_file=str(output_path),
             video_model=video_model,
             generation_mode=generation_mode,
+            retain_intermediate_files=retain_intermediate_files,
         )
 
         self.worker.moveToThread(
@@ -2328,6 +2432,10 @@ class OneMinuteWindow(QMainWindow):
 
         self.refresh_models_button.setDisabled(
             generating or self.model_thread is not None
+        )
+
+        self.retain_intermediate_checkbox.setDisabled(
+            generating
         )
 
         self.prompt_input.setDisabled(

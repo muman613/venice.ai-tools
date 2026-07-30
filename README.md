@@ -80,6 +80,8 @@ python venice-ai-oneminute.py
 
 The one-minute video tool loads current Venice video models from `/api/v1/models?type=video`. Choose `Image-to-video` or `Text-to-video` from the `Mode` dropdown, then choose a model from the refreshed `Video model` dropdown. When model metadata marks models as uncensored, the dropdown prefers those models.
 
+Use `Retain intermediate files` to keep or remove generated segment MP4s, continuation frames, and the segment JSON after the final MP4 is saved. The checkbox setting is remembered between runs.
+
 Run the model listing helper:
 
 ```bash
