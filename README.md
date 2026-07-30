@@ -4,8 +4,10 @@ Small Python utilities for working with the Venice.ai API.
 
 ## Tools
 
-- `venice-story-writer.py` - PySide6 desktop chat/story-writing front end for Venice chat models.
-- `venice-ai-oneminute.py` - PySide6 desktop workflow for generating a one-minute video as four sequential image-to-video or text-to-video clips, then stitching them with FFmpeg.
+- `venice-ai-story-writer.py` - PySide6 desktop chat/story-writing front end for Venice chat models.
+- `venice-ai-image.py` - PySide6 desktop tool for generating images with Venice image models.
+- `venice-ai-video.py` - PySide6 desktop workflow for generating variable-length videos as sequential image-to-video or text-to-video clips, then stitching them with FFmpeg.
+- `venice-ai-tts.py` - PySide6 desktop tool for converting TXT or HTML input files to Venice text-to-speech MP3 output.
 - `list-models.py` - Prints Venice model metadata matching Wan 2.7 from the models endpoint.
 
 ## Requirements
@@ -53,12 +55,12 @@ sudo apt install ffmpeg
 Run the story-writing GUI:
 
 ```bash
-python venice-story-writer.py
+python venice-ai-story-writer.py
 ```
 
 ### Story Writer
 
-`venice-story-writer.py` is a desktop writing assistant for Venice chat models.
+`venice-ai-story-writer.py` is a desktop writing assistant for Venice chat models.
 
 - Enter or edit your prompt in the `Request` text area.
 - Click `Send`, or press `Ctrl+Enter`, to generate a response.
@@ -72,15 +74,31 @@ python venice-story-writer.py
 
 The `Max tokens` control limits how much text Venice can return. If a response stops because it reached that limit, the status bar reports that explicitly. Increase `Max tokens` or ask the model to continue when that happens.
 
-Run the one-minute video generator:
+Run the image generator:
 
 ```bash
-python venice-ai-oneminute.py
+python venice-ai-image.py
 ```
 
-The one-minute video tool loads current Venice video models from `/api/v1/models?type=video`. Choose `Image-to-video` or `Text-to-video` from the `Mode` dropdown, then choose a model from the refreshed `Video model` dropdown. When model metadata marks models as uncensored, the dropdown prefers those models.
+The image tool loads current Venice image models and style presets, then saves generated variants to the selected output directory. Choose width/height, aspect-ratio, or resolution-tier sizing depending on the selected model.
+
+Run the video generator:
+
+```bash
+python venice-ai-video.py
+```
+
+The video tool loads current Venice video models from `/api/v1/models?type=video`. Choose `Image-to-video` or `Text-to-video` from the `Mode` dropdown, choose a model from the refreshed `Video model` dropdown, and set the requested output length in seconds. When model metadata marks models as uncensored, the dropdown prefers those models.
 
 Use `Retain intermediate files` to keep or remove generated segment MP4s, continuation frames, and the segment JSON after the final MP4 is saved. The checkbox setting is remembered between runs.
+
+Run the text-to-speech GUI:
+
+```bash
+python venice-ai-tts.py
+```
+
+Choose a `.txt`, `.html`, or `.htm` file, select an output directory and voice, then convert it to an MP3. HTML files are extracted to editable text before conversion.
 
 Run the model listing helper:
 
@@ -90,6 +108,6 @@ python list-models.py
 
 ## Notes
 
-- `venice-ai-oneminute.py` requires a starting reference image in image-to-video mode and writes the final output as an MP4.
-- The video generator creates four segment MP4 files before producing the final stitched video.
-- `venice-story-writer.py` stores no chat history automatically; use the GUI export buttons to save story text or full chat history.
+- `venice-ai-video.py` requires a starting reference image in image-to-video mode and writes the final output as an MP4.
+- The video generator creates one segment MP4 per planned segment before producing the final stitched video.
+- `venice-ai-story-writer.py` stores no chat history automatically; use the GUI export buttons to save story text or full chat history.

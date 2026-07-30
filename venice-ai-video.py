@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Generate a one-minute Venice AI video as four sequential 15-second
-video clips.
+Generate a Venice AI video as sequential API-sized clips.
 
 Workflow:
-1. Split the one-minute prompt into four prompts.
-2. Generate four sequential image-to-video or text-to-video segments.
+1. Split the requested video prompt across the requested output duration.
+2. Generate sequential image-to-video or text-to-video segments.
 3. In image-to-video mode, feed each segment's final frame into the next.
-4. Concatenate all four MP4 files with FFmpeg.
+4. Concatenate all segment MP4 files with FFmpeg.
 """
 
 import base64
@@ -39,6 +38,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QTextBrowser,
     QTextEdit,
     QVBoxLayout,
@@ -55,6 +55,7 @@ API_BASE_URL = "https://api.venice.ai/api/v1"
 CHAT_URL = f"{API_BASE_URL}/chat/completions"
 VIDEO_QUEUE_URL = f"{API_BASE_URL}/video/queue"
 VIDEO_RETRIEVE_URL = f"{API_BASE_URL}/video/retrieve"
+VIDEO_QUOTE_URL = f"{API_BASE_URL}/video/quote"
 MODELS_URL = f"{API_BASE_URL}/models"
 
 SEGMENT_MODEL = os.environ.get(
@@ -73,11 +74,9 @@ DEFAULT_TEXT_VIDEO_MODEL = os.environ.get(
     "VENICE_TEXT_VIDEO_MODEL",
     "wan-2.5-preview-text-to-video",
 ).strip()
-VIDEO_DURATION = "15s"
+MAX_SEGMENT_SECONDS = 15
 VIDEO_RESOLUTION = "1080p"
 VIDEO_ASPECT_RATIO = "16:9"
-
-SEGMENT_COUNT = 4
 
 HTTP_TIMEOUT = (30, 180)
 DOWNLOAD_TIMEOUT = (30, 600)
@@ -92,7 +91,7 @@ VIDEO_POLL_INTERVAL_SECONDS = float(
 
 MAX_SOURCE_IMAGE_BYTES = 25 * 1024 * 1024
 SETTINGS_ORG = "VeniceAI"
-SETTINGS_APP = "OneMinuteVideo"
+SETTINGS_APP = "Video"
 RETAIN_INTERMEDIATE_FILES_KEY = "retain_intermediate_files"
 
 COMPLETED_STATUSES = {
@@ -119,11 +118,17 @@ FAILED_STATUSES = {
 
 @dataclass
 class Segment:
-    """One 15-second video segment."""
+    """One generated video segment."""
 
     number: int
+    duration_seconds: int
     description: str
     transition_note: str = ""
+
+    @property
+    def duration(self):
+        """Return Venice's duration string for this segment."""
+        return f"{self.duration_seconds}s"
 
 
 @dataclass
@@ -343,7 +348,7 @@ class VeniceVideoModelsWorker(QObject):
                 timeout=HTTP_TIMEOUT,
             )
 
-            diagnostic = VeniceOneMinuteWorker.response_diagnostic(
+            diagnostic = VeniceVideoWorker.response_diagnostic(
                 response
             )
 
@@ -378,7 +383,7 @@ class VeniceVideoModelsWorker(QObject):
             )
 
 
-class VeniceOneMinuteWorker(QObject):
+class VeniceVideoWorker(QObject):
     """Perform API and FFmpeg work outside the Qt event loop."""
 
     progress = Signal(int, str)
@@ -394,6 +399,7 @@ class VeniceOneMinuteWorker(QObject):
         output_file,
         video_model,
         generation_mode,
+        total_seconds,
         retain_intermediate_files,
     ):
         super().__init__()
@@ -404,6 +410,10 @@ class VeniceOneMinuteWorker(QObject):
         self.output_file = Path(output_file)
         self.video_model = video_model
         self.generation_mode = generation_mode
+        self.total_seconds = total_seconds
+        self.segment_durations = self.plan_segment_durations(
+            total_seconds
+        )
         self.retain_intermediate_files = retain_intermediate_files
         self.destination_dir = self.output_file.parent
         self.output_stem = self.output_file.stem
@@ -436,9 +446,11 @@ class VeniceOneMinuteWorker(QObject):
                     "reference image."
                 )
 
+            self.estimate_generation_cost()
+
             self.progress.emit(
                 0,
-                "Segmenting the one-minute prompt...",
+                "Segmenting the video prompt...",
             )
 
             segments = self.segment_story()
@@ -446,13 +458,14 @@ class VeniceOneMinuteWorker(QObject):
 
             current_image_path = self.source_file
             segment_files = []
+            segment_count = len(segments)
 
             for segment in segments:
                 self.progress.emit(
                     segment.number - 1,
                     (
                         f"Preparing segment {segment.number} "
-                        f"of {SEGMENT_COUNT}..."
+                        f"of {segment_count}..."
                     ),
                 )
 
@@ -489,7 +502,7 @@ class VeniceOneMinuteWorker(QObject):
 
                 if (
                     self.is_image_to_video
-                    and segment.number < SEGMENT_COUNT
+                    and segment.number < segment_count
                 ):
                     continuation_frame = (
                         self.destination_dir
@@ -524,15 +537,15 @@ class VeniceOneMinuteWorker(QObject):
                     segment.number,
                     (
                         f"Saved segment {segment.number} "
-                        f"of {SEGMENT_COUNT}."
+                        f"of {segment_count}."
                     ),
                 )
 
             self.output_file.unlink(missing_ok=True)
 
             self.progress.emit(
-                SEGMENT_COUNT,
-                "Stitching the four segments with FFmpeg...",
+                segment_count,
+                "Stitching the segments with FFmpeg...",
             )
 
             self.stitch_segments(
@@ -562,6 +575,19 @@ class VeniceOneMinuteWorker(QObject):
         """Return True when using image-to-video generation."""
         return self.generation_mode == IMAGE_TO_VIDEO_MODE
 
+    @staticmethod
+    def plan_segment_durations(total_seconds):
+        """Split requested seconds into API-sized segment durations."""
+        durations = []
+        remaining = int(total_seconds)
+
+        while remaining > 0:
+            duration = min(MAX_SEGMENT_SECONDS, remaining)
+            durations.append(duration)
+            remaining -= duration
+
+        return durations
+
     def track_intermediate_file(self, path):
         """Track a temporary artifact for optional cleanup."""
         path = Path(path)
@@ -572,7 +598,7 @@ class VeniceOneMinuteWorker(QObject):
         """Delete intermediate artifacts when retention is disabled."""
         if self.retain_intermediate_files:
             self.progress.emit(
-                SEGMENT_COUNT,
+                len(self.segment_durations),
                 "Retaining intermediate files.",
             )
             return
@@ -585,7 +611,7 @@ class VeniceOneMinuteWorker(QObject):
                     removed += 1
             except OSError as exc:
                 self.progress.emit(
-                    SEGMENT_COUNT,
+                    len(self.segment_durations),
                     (
                         f"Could not delete intermediate file "
                         f"{path.name}: {exc}"
@@ -593,8 +619,60 @@ class VeniceOneMinuteWorker(QObject):
                 )
 
         self.progress.emit(
-            SEGMENT_COUNT,
+            len(self.segment_durations),
             f"Removed {removed} intermediate file(s).",
+        )
+
+    def quote_payload(self, duration_seconds):
+        """Return Venice video quote inputs for one segment."""
+        payload = {
+            "model": self.video_model,
+            "duration": f"{duration_seconds}s",
+            "resolution": VIDEO_RESOLUTION,
+        }
+
+        if not self.is_image_to_video:
+            payload["aspect_ratio"] = VIDEO_ASPECT_RATIO
+
+        return payload
+
+    def estimate_generation_cost(self):
+        """Log a Venice video quote total when the quote API is available."""
+        total = 0.0
+
+        try:
+            for duration_seconds in self.segment_durations:
+                data = self.post_json(
+                    VIDEO_QUOTE_URL,
+                    self.quote_payload(duration_seconds),
+                )
+                quote = self.find_first_value(
+                    data,
+                    {"quote", "cost", "price", "amount"},
+                )
+
+                if quote is None:
+                    raise RuntimeError(
+                        "The quote response did not include a quote."
+                    )
+
+                total += float(quote)
+
+        except (
+            VeniceAPIError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            self.progress.emit(
+                0,
+                f"Cost estimate unavailable: {exc}",
+            )
+            return
+
+        self.progress.emit(
+            0,
+            f"Estimated video generation cost: ${total:.4f}",
         )
 
     # ------------------------------------------------------------------
@@ -687,7 +765,7 @@ class VeniceOneMinuteWorker(QObject):
                     return value
 
             for value in data.values():
-                found = VeniceOneMinuteWorker.find_first_value(
+                found = VeniceVideoWorker.find_first_value(
                     value,
                     names,
                 )
@@ -697,7 +775,7 @@ class VeniceOneMinuteWorker(QObject):
 
         elif isinstance(data, list):
             for item in data:
-                found = VeniceOneMinuteWorker.find_first_value(
+                found = VeniceVideoWorker.find_first_value(
                     item,
                     names,
                 )
@@ -765,7 +843,7 @@ class VeniceOneMinuteWorker(QObject):
     # ------------------------------------------------------------------
 
     def segment_story(self):
-        """Split the one-minute concept into four 15-second prompts."""
+        """Split the video concept into timed segment prompts."""
         payload = {
             "model": SEGMENT_MODEL,
             "messages": [
@@ -783,7 +861,13 @@ class VeniceOneMinuteWorker(QObject):
                 },
             ],
             "temperature": 0.6,
-            "max_tokens": 2400,
+            "max_tokens": min(
+                12000,
+                max(
+                    2400,
+                    len(self.segment_durations) * 700,
+                ),
+            ),
         }
 
         data = self.post_json(
@@ -804,6 +888,42 @@ class VeniceOneMinuteWorker(QObject):
 
     def segmentation_prompt(self):
         """Create the segmentation-model instruction."""
+        segment_count = len(self.segment_durations)
+        segment_lines = "\n".join(
+            (
+                f"- Segment {index}: {duration} seconds"
+            )
+            for index, duration in enumerate(
+                self.segment_durations,
+                start=1,
+            )
+        )
+        example_items = []
+        for index, duration in enumerate(
+            self.segment_durations,
+            start=1,
+        ):
+            final_note = (
+                "Description of the final shot."
+                if index == segment_count
+                else "Exact visual state of the final frame."
+            )
+            example_items.append(
+                "\n".join(
+                    [
+                        "  {",
+                        f'    "segment": {index},',
+                        (
+                            '    "description": '
+                            f'"Complete prompt for this {duration}-second segment.",'
+                        ),
+                        f'    "transition_note": "{final_note}"',
+                        "  }",
+                    ]
+                )
+            )
+        example_json = ",\n".join(example_items)
+
         if self.is_image_to_video:
             mode_context = """
 The first segment starts from a reference image supplied separately.
@@ -825,18 +945,21 @@ segment.
             )
 
         return f"""
-Divide the following one-minute video concept into exactly four sequential
-15-second {self.generation_mode} prompts.
+Divide the following video concept into exactly {segment_count} sequential
+{self.generation_mode} prompts covering exactly {self.total_seconds} seconds.
+
+Segment durations:
+{segment_lines}
 
 {mode_context}
 
 Requirements:
 
-1. Return exactly four segments.
-2. Each segment must describe approximately 15 seconds of action.
+1. Return exactly {segment_count} segments.
+2. Each segment must describe action for its assigned duration.
 3. Segment 2 must continue directly from the end of segment 1.
-4. Segment 3 must continue directly from the end of segment 2.
-5. Segment 4 must continue directly from the end of segment 3.
+4. Each later segment must continue directly from the end of the prior segment.
+5. Do not skip or compress the requested timeline.
 6. Do not restart or recap the story in later segments.
 7. Repeat important character, clothing, environment, lighting, camera,
    lens, and visual-style details when needed for consistency.
@@ -851,29 +974,10 @@ Requirements:
 Return only a JSON array in exactly this form:
 
 [
-  {{
-    "segment": 1,
-    "description": "Complete prompt for the first 15-second video.",
-    "transition_note": "Exact visual state of the final frame."
-  }},
-  {{
-    "segment": 2,
-    "description": "Complete prompt continuing from segment 1.",
-    "transition_note": "Exact visual state of the final frame."
-  }},
-  {{
-    "segment": 3,
-    "description": "Complete prompt continuing from segment 2.",
-    "transition_note": "Exact visual state of the final frame."
-  }},
-  {{
-    "segment": 4,
-    "description": "Complete prompt continuing from segment 3.",
-    "transition_note": "Description of the final shot."
-  }}
+{example_json}
 ]
 
-Original one-minute concept:
+Original video concept:
 
 {self.prompt}
 """.strip()
@@ -920,10 +1024,10 @@ Original one-minute concept:
                 "The segmentation response must be a JSON array."
             )
 
-        if len(data) != SEGMENT_COUNT:
+        if len(data) != len(self.segment_durations):
             raise ValueError(
                 f"The segmentation response contained {len(data)} "
-                f"segments instead of {SEGMENT_COUNT}."
+                f"segments instead of {len(self.segment_durations)}."
             )
 
         segments = []
@@ -954,6 +1058,9 @@ Original one-minute concept:
             segments.append(
                 Segment(
                     number=expected_number,
+                    duration_seconds=self.segment_durations[
+                        expected_number - 1
+                    ],
                     description=description,
                     transition_note=transition_note,
                 )
@@ -968,7 +1075,7 @@ Original one-minute concept:
                 "segment": segment.number,
                 "mode": self.generation_mode,
                 "model": self.video_model,
-                "duration": VIDEO_DURATION,
+                "duration": segment.duration,
                 "description": segment.description,
                 "transition_note": segment.transition_note,
             }
@@ -1098,7 +1205,7 @@ Original one-minute concept:
         payload = {
             "model": self.video_model,
             "prompt": segment.description,
-            "duration": VIDEO_DURATION,
+            "duration": segment.duration,
             "resolution": VIDEO_RESOLUTION,
         }
 
@@ -1380,7 +1487,7 @@ Original one-minute concept:
         url = str(url)
 
         if url.startswith("data:"):
-            VeniceOneMinuteWorker.write_data_url(
+            VeniceVideoWorker.write_data_url(
                 url,
                 output_path,
             )
@@ -1627,11 +1734,11 @@ class PromptEdit(QTextEdit):
 
         self.setAcceptRichText(False)
         self.setPlaceholderText(
-            "Describe the complete one-minute video..."
+            "Describe the complete video..."
         )
 
 
-class OneMinuteWindow(QMainWindow):
+class VideoWindow(QMainWindow):
     """Main GUI window."""
 
     def __init__(self):
@@ -1653,7 +1760,7 @@ class OneMinuteWindow(QMainWindow):
         )
 
         self.setWindowTitle(
-            "Venice One-Minute Video"
+            "Venice AI Video"
         )
         self.resize(980, 720)
 
@@ -1680,6 +1787,12 @@ class OneMinuteWindow(QMainWindow):
         self.output_file_button.clicked.connect(
             self.choose_output_file
         )
+
+        self.output_seconds_spin = QSpinBox()
+        self.output_seconds_spin.setRange(1, 3600)
+        self.output_seconds_spin.setSingleStep(5)
+        self.output_seconds_spin.setValue(60)
+        self.output_seconds_spin.setSuffix(" seconds")
 
         self.retain_intermediate_checkbox = QCheckBox(
             "Retain intermediate files"
@@ -1725,7 +1838,11 @@ class OneMinuteWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(
             0,
-            SEGMENT_COUNT,
+            len(
+                VeniceVideoWorker.plan_segment_durations(
+                    self.output_seconds_spin.value()
+                )
+            ),
         )
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat(
@@ -1799,6 +1916,10 @@ class OneMinuteWindow(QMainWindow):
             output_row,
         )
         form.addRow(
+            "Output length",
+            self.output_seconds_spin,
+        )
+        form.addRow(
             "",
             self.retain_intermediate_checkbox,
         )
@@ -1812,7 +1933,7 @@ class OneMinuteWindow(QMainWindow):
         layout = QVBoxLayout()
         layout.addLayout(form)
         layout.addWidget(
-            QLabel("One-minute prompt")
+            QLabel("Video prompt")
         )
         layout.addWidget(
             self.prompt_input,
@@ -2180,6 +2301,12 @@ class OneMinuteWindow(QMainWindow):
 
         generation_mode = self.selected_generation_mode()
         video_model = self.selected_video_model()
+        total_seconds = self.output_seconds_spin.value()
+        segment_durations = (
+            VeniceVideoWorker.plan_segment_durations(
+                total_seconds
+            )
+        )
         retain_intermediate_files = (
             self.retain_intermediate_checkbox.isChecked()
         )
@@ -2216,7 +2343,7 @@ class OneMinuteWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Missing prompt",
-                "Enter a one-minute video prompt.",
+                "Enter a video prompt.",
             )
             return
 
@@ -2243,6 +2370,10 @@ class OneMinuteWindow(QMainWindow):
             self.output_file_edit.setText(str(output_path))
 
         self.log_display.clear()
+        self.progress_bar.setRange(
+            0,
+            len(segment_durations),
+        )
         self.progress_bar.setValue(0)
         self.set_generating(True)
 
@@ -2253,8 +2384,17 @@ class OneMinuteWindow(QMainWindow):
             f"Video model: {video_model}"
         )
         self.append_log(
-            f"Plan: {SEGMENT_COUNT} × {VIDEO_DURATION} "
-            f"at {VIDEO_RESOLUTION}"
+            (
+                f"Plan: {total_seconds} seconds across "
+                f"{len(segment_durations)} segment(s): "
+                + ", ".join(
+                    f"{duration}s"
+                    for duration in segment_durations
+                )
+            )
+        )
+        self.append_log(
+            f"Resolution: {VIDEO_RESOLUTION}"
         )
         self.append_log(
             f"Mode: {generation_mode}"
@@ -2292,13 +2432,14 @@ class OneMinuteWindow(QMainWindow):
 
         self.thread = QThread(self)
 
-        self.worker = VeniceOneMinuteWorker(
+        self.worker = VeniceVideoWorker(
             api_key=self.api_key,
             prompt=prompt,
             source_file=source_file,
             output_file=str(output_path),
             video_model=video_model,
             generation_mode=generation_mode,
+            total_seconds=total_seconds,
             retain_intermediate_files=retain_intermediate_files,
         )
 
@@ -2363,7 +2504,7 @@ class OneMinuteWindow(QMainWindow):
     def generation_finished(self, final_path):
         """Handle successful generation."""
         self.progress_bar.setValue(
-            SEGMENT_COUNT
+            self.progress_bar.maximum()
         )
 
         self.status_label.setText(
@@ -2419,6 +2560,10 @@ class OneMinuteWindow(QMainWindow):
         )
 
         self.output_file_edit.setDisabled(
+            generating
+        )
+
+        self.output_seconds_spin.setDisabled(
             generating
         )
 
@@ -2495,7 +2640,7 @@ def main():
     """Start the GUI application."""
     app = QApplication(sys.argv)
 
-    window = OneMinuteWindow()
+    window = VideoWindow()
     window.show()
 
     sys.exit(app.exec())
