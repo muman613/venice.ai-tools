@@ -138,6 +138,7 @@ class StoryWriterWindow(QMainWindow):
         self.thread = None
         self.worker = None
         self.pending_prompt = ""
+        self.current_entry = None
         self.conversation_history = []
 
         self.setWindowTitle("Venice AI Story Writer")
@@ -332,6 +333,7 @@ class StoryWriterWindow(QMainWindow):
         """Record and display the generated response."""
         timestamp = datetime.now().strftime("%H:%M")
         entry = ChatEntry(timestamp, self.pending_prompt, response)
+        self.current_entry = entry
         self.conversation_history.append(entry)
         self.refresh_response_display(response)
         self.status_label.setText(self.response_status(response, finish_reason, usage))
@@ -594,12 +596,13 @@ class StoryWriterWindow(QMainWindow):
             return
         if QMessageBox.question(self, "Clear story", "Clear all story text?") == QMessageBox.Yes:
             self.story_display.clear()
+            self.current_entry = None
             self.conversation_history.clear()
             self.status_label.setText("Story cleared.")
 
     def save_story(self):
-        """Save only generated responses in the selected format."""
-        if not self.conversation_history:
+        """Save only the latest generated response in the selected format."""
+        if not self.current_entry:
             QMessageBox.warning(self, "No story", "No story text to save.")
             return
 
@@ -646,8 +649,8 @@ class StoryWriterWindow(QMainWindow):
         return path
 
     def story_markdown(self):
-        """Return generated responses as one Markdown document."""
-        return "\n\n---\n\n".join(entry.response for entry in self.conversation_history)
+        """Return the latest generated response as Markdown."""
+        return self.current_entry.response if self.current_entry else ""
 
     def story_html(self):
         """Return generated responses as a styled HTML document."""
@@ -727,9 +730,9 @@ class StoryWriterWindow(QMainWindow):
         self.status_label.setText(f"Exported chat to {Path(filename).name}")
 
     def save_html(self):
-        """Export the rendered conversation as an HTML document."""
-        if not self.conversation_history:
-            QMessageBox.warning(self, "No chat", "No chat history to export.")
+        """Export the latest rendered response as an HTML document."""
+        if not self.current_entry:
+            QMessageBox.warning(self, "No story", "No story text to export.")
             return
 
         filename, _ = QFileDialog.getSaveFileName(
@@ -745,7 +748,7 @@ class StoryWriterWindow(QMainWindow):
         if path.suffix.lower() not in (".html", ".htm"):
             path = path.with_suffix(".html")
 
-        path.write_text(self.display_html(), encoding="utf-8")
+        path.write_text(self.response_html(self.current_entry.response), encoding="utf-8")
         self.status_label.setText(f"Exported HTML to {path.name}")
 
     def set_generating(self, generating):

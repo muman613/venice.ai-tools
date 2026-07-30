@@ -66,9 +66,9 @@ python venice-story-writer.py
 - The prompt remains in the `Request` area after generation so you can revise it and send again.
 - The `Clear` button clears only the request text.
 - `Clear Chat` clears the saved in-memory conversation history and the visible response.
-- `Save Story` exports only generated responses as TXT, Markdown, or HTML.
+- `Save Story` exports the latest generated response as TXT, Markdown, or HTML.
 - `Export Chat` exports prompts and responses together as Markdown.
-- `Export HTML` exports the rendered full chat as HTML.
+- `Export HTML` exports the latest rendered response as HTML.
 
 The `Max tokens` control limits how much text Venice can return. If a response stops because it reached that limit, the status bar reports that explicitly. Increase `Max tokens` or ask the model to continue when that happens.
 
