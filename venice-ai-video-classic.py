@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-Generate a Venice AI video as sequential API-sized clips.
+Generate a one-minute Venice AI video as four sequential 15-second
+Wan 2.7 image-to-video clips.
 
 Workflow:
-1. Split the requested video prompt across the requested output duration.
-2. Generate sequential image-to-video or text-to-video segments.
-3. In image-to-video mode, feed each segment's final frame into the next.
-4. Concatenate all segment MP4 files with FFmpeg.
+1. Split the one-minute prompt into four prompts.
+2. Generate segment 1 from the selected reference image.
+3. Extract segment 1's final frame.
+4. Use that frame as the input image for segment 2.
+5. Repeat through segment 4.
+6. Concatenate all four MP4 files with FFmpeg.
+
+Wan 2.7 public API requirements:
+- model: wan-2-7-image-to-video
+- duration: 15s
+- resolution: 1080p
+- image_url: base64 image data URL
+- Do not send aspect_ratio.
+- Do not send audio. Native audio may already be embedded in the MP4.
 """
 
 import base64
@@ -23,11 +34,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QComboBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -38,7 +47,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QSpinBox,
     QTextBrowser,
     QTextEdit,
     QVBoxLayout,
@@ -55,28 +63,17 @@ API_BASE_URL = "https://api.venice.ai/api/v1"
 CHAT_URL = f"{API_BASE_URL}/chat/completions"
 VIDEO_QUEUE_URL = f"{API_BASE_URL}/video/queue"
 VIDEO_RETRIEVE_URL = f"{API_BASE_URL}/video/retrieve"
-VIDEO_QUOTE_URL = f"{API_BASE_URL}/video/quote"
-MODELS_URL = f"{API_BASE_URL}/models"
 
 SEGMENT_MODEL = os.environ.get(
     "VENICE_SEGMENT_MODEL",
     "venice-uncensored-1-2",
 ).strip()
 
-IMAGE_TO_VIDEO_MODE = "image-to-video"
-TEXT_TO_VIDEO_MODE = "text-to-video"
-
-DEFAULT_IMAGE_VIDEO_MODEL = os.environ.get(
-    "VENICE_IMAGE_VIDEO_MODEL",
-    "wan-2-7-image-to-video",
-).strip()
-DEFAULT_TEXT_VIDEO_MODEL = os.environ.get(
-    "VENICE_TEXT_VIDEO_MODEL",
-    "wan-2.5-preview-text-to-video",
-).strip()
-MAX_SEGMENT_SECONDS = 15
+VIDEO_MODEL = "wan-2-7-image-to-video"
+VIDEO_DURATION = "15s"
 VIDEO_RESOLUTION = "1080p"
-VIDEO_ASPECT_RATIO = "16:9"
+
+SEGMENT_COUNT = 4
 
 HTTP_TIMEOUT = (30, 180)
 DOWNLOAD_TIMEOUT = (30, 600)
@@ -94,11 +91,6 @@ MAX_RETRIEVE_HTTP_500_RETRIES = int(
 )
 
 MAX_SOURCE_IMAGE_BYTES = 25 * 1024 * 1024
-SETTINGS_ORG = "VeniceAI"
-SETTINGS_APP = "Video"
-RETAIN_INTERMEDIATE_FILES_KEY = "retain_intermediate_files"
-STARTING_IMAGE_PATH_KEY = "starting_image_path"
-PROMPT_DIRECTORY_KEY = "prompt_directory"
 
 COMPLETED_STATUSES = {
     "COMPLETED",
@@ -124,29 +116,11 @@ FAILED_STATUSES = {
 
 @dataclass
 class Segment:
-    """One generated video segment."""
+    """One 15-second video segment."""
 
     number: int
-    duration_seconds: int
     description: str
     transition_note: str = ""
-
-    @property
-    def duration(self):
-        """Return Venice's duration string for this segment."""
-        return f"{self.duration_seconds}s"
-
-
-@dataclass
-class VideoModelOption:
-    """One selectable Venice video model."""
-
-    model_id: str
-    label: str
-    uncensored: bool = False
-    durations: tuple = ()
-    resolutions: tuple = ()
-    aspect_ratios: tuple = ()
 
 
 class VeniceAPIError(RuntimeError):
@@ -164,266 +138,11 @@ class VeniceAPIError(RuntimeError):
         )
 
 
-def model_text(model):
-    """Return searchable text for a model metadata object."""
-    return json.dumps(
-        model,
-        ensure_ascii=False,
-        sort_keys=True,
-    ).lower()
-
-
-def model_identifier(model):
-    """Return the Venice model ID from a model metadata object."""
-    if not isinstance(model, dict):
-        return ""
-
-    value = model.get("id") or model.get("model")
-    return str(value).strip() if value else ""
-
-
-def model_display_name(model):
-    """Return the human-readable model name when available."""
-    if not isinstance(model, dict):
-        return ""
-
-    model_spec = model.get("model_spec")
-    if isinstance(model_spec, dict):
-        value = model_spec.get("name")
-        if value:
-            return str(value).strip()
-
-    value = model.get("name")
-    return str(value).strip() if value else ""
-
-
-def normalize_model_list(data):
-    """Return a list from Venice's model-list response shapes."""
-    models = data.get("data", data) if isinstance(data, dict) else data
-
-    if isinstance(models, dict):
-        return list(models.values())
-
-    if isinstance(models, list):
-        return models
-
-    return []
-
-
-def is_text_to_video_model(model):
-    """Return True for video models that accept text prompts."""
-    if not isinstance(model, dict):
-        return False
-
-    model_type = str(model.get("type", "")).lower()
-    text = model_text(model)
-
-    if model_type and model_type != "video":
-        return False
-
-    text_to_video_markers = {
-        "text-to-video",
-        "text to video",
-        "text_to_video",
-        "text2video",
-        "t2v",
-    }
-
-    return any(marker in text for marker in text_to_video_markers)
-
-
-def is_image_to_video_model(model):
-    """Return True for video models that accept an input image."""
-    if not isinstance(model, dict):
-        return False
-
-    model_type = str(model.get("type", "")).lower()
-    text = model_text(model)
-
-    if model_type and model_type != "video":
-        return False
-
-    image_to_video_markers = {
-        "image-to-video",
-        "image to video",
-        "image_to_video",
-        "image2video",
-        "i2v",
-    }
-
-    return any(marker in text for marker in image_to_video_markers)
-
-
-def is_uncensored_model(model):
-    """Return True when the model metadata advertises uncensored behavior."""
-    text = model_text(model)
-    return (
-        "uncensored" in text
-        or "unrestricted" in text
-    )
-
-
-def model_constraints(model):
-    """Return provider-advertised constraints for a model."""
-    if not isinstance(model, dict):
-        return {}
-
-    model_spec = model.get("model_spec")
-    if isinstance(model_spec, dict):
-        constraints = model_spec.get("constraints")
-        if isinstance(constraints, dict):
-            return constraints
-
-    constraints = model.get("constraints")
-    if isinstance(constraints, dict):
-        return constraints
-
-    return {}
-
-
-def tuple_constraint(constraints, name):
-    """Return one list-valued model constraint as a tuple of strings."""
-    value = constraints.get(name)
-    if not isinstance(value, list):
-        return ()
-
-    return tuple(str(item) for item in value if item)
-
-
-def model_option(model):
-    """Build a GUI option from model metadata."""
-    model_id = model_identifier(model)
-    name = model_display_name(model)
-    uncensored = is_uncensored_model(model)
-    constraints = model_constraints(model)
-
-    if name and name != model_id:
-        label = f"{name} ({model_id})"
-    else:
-        label = model_id
-
-    if uncensored:
-        label = f"{label} - uncensored"
-
-    return VideoModelOption(
-        model_id=model_id,
-        label=label,
-        uncensored=uncensored,
-        durations=tuple_constraint(constraints, "durations"),
-        resolutions=tuple_constraint(constraints, "resolutions"),
-        aspect_ratios=tuple_constraint(constraints, "aspect_ratios"),
-    )
-
-
-def extract_video_models(data, generation_mode):
-    """Extract selectable video model options from API data."""
-    if generation_mode == IMAGE_TO_VIDEO_MODE:
-        predicate = is_image_to_video_model
-        mode_label = "image-to-video"
-    else:
-        predicate = is_text_to_video_model
-        mode_label = "text-to-video"
-
-    options = [
-        model_option(model)
-        for model in normalize_model_list(data)
-        if predicate(model) and model_identifier(model)
-    ]
-
-    options.sort(
-        key=lambda option: (
-            not option.uncensored,
-            option.label.lower(),
-        )
-    )
-
-    uncensored_options = [
-        option
-        for option in options
-        if option.uncensored
-    ]
-
-    if uncensored_options:
-        return (
-            uncensored_options,
-            f"Loaded uncensored {mode_label} models.",
-        )
-
-    return (
-        options,
-        (
-            "No models were explicitly marked uncensored; "
-            f"showing {mode_label} models."
-        ),
-    )
-
-
 # ---------------------------------------------------------------------------
 # Background worker
 # ---------------------------------------------------------------------------
 
-class VeniceVideoModelsWorker(QObject):
-    """Load Venice video models outside the Qt event loop."""
-
-    finished = Signal(object, str)
-    failed = Signal(str)
-
-    def __init__(self, api_key, generation_mode):
-        super().__init__()
-        self.api_key = api_key
-        self.generation_mode = generation_mode
-
-    def run(self):
-        """Fetch current video models from Venice."""
-        try:
-            response = requests.get(
-                MODELS_URL,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Accept": "application/json",
-                },
-                params={
-                    "type": "video",
-                },
-                timeout=HTTP_TIMEOUT,
-            )
-
-            diagnostic = VeniceVideoWorker.response_diagnostic(
-                response
-            )
-
-            if not response.ok:
-                raise VeniceAPIError(
-                    response.status_code,
-                    MODELS_URL,
-                    diagnostic,
-            )
-
-            data = response.json()
-            options, message = extract_video_models(
-                data,
-                self.generation_mode,
-            )
-
-            if not options:
-                raise RuntimeError(
-                    "The models API did not return any "
-                    f"{self.generation_mode} models."
-                )
-
-            self.finished.emit(options, message)
-
-        except (
-            requests.RequestException,
-            RuntimeError,
-            ValueError,
-        ) as exc:
-            self.failed.emit(
-                f"{type(exc).__name__}: {exc}"
-            )
-
-
-class VeniceVideoWorker(QObject):
+class VeniceOneMinuteWorker(QObject):
     """Perform API and FFmpeg work outside the Qt event loop."""
 
     progress = Signal(int, str)
@@ -437,30 +156,15 @@ class VeniceVideoWorker(QObject):
         prompt,
         source_file,
         output_file,
-        video_model,
-        generation_mode,
-        total_seconds,
-        segment_durations,
-        video_resolution,
-        video_aspect_ratio,
-        retain_intermediate_files,
     ):
         super().__init__()
 
         self.api_key = api_key
         self.prompt = prompt
-        self.source_file = Path(source_file) if source_file else None
+        self.source_file = Path(source_file)
         self.output_file = Path(output_file)
-        self.video_model = video_model
-        self.generation_mode = generation_mode
-        self.total_seconds = total_seconds
-        self.segment_durations = list(segment_durations)
-        self.video_resolution = video_resolution
-        self.video_aspect_ratio = video_aspect_ratio
-        self.retain_intermediate_files = retain_intermediate_files
         self.destination_dir = self.output_file.parent
         self.output_stem = self.output_file.stem
-        self.intermediate_files = []
 
         self.session = requests.Session()
         self.session.headers.update(
@@ -480,36 +184,29 @@ class VeniceVideoWorker(QObject):
 
             self.verify_dependencies()
 
-            if (
-                self.is_image_to_video
-                and self.source_file is None
-            ):
-                raise RuntimeError(
-                    "Image-to-video mode requires a starting "
-                    "reference image."
-                )
-
-            self.estimate_generation_cost()
-
             self.progress.emit(
                 0,
-                "Segmenting the video prompt...",
+                "Segmenting the one-minute prompt...",
             )
 
             segments = self.segment_story()
             self.save_segments_json(segments)
 
+            # Segment 1 starts from the user-selected image.
             current_image_path = self.source_file
             segment_files = []
-            segment_count = len(segments)
 
             for segment in segments:
                 self.progress.emit(
                     segment.number - 1,
                     (
                         f"Preparing segment {segment.number} "
-                        f"of {segment_count}..."
+                        f"of {SEGMENT_COUNT}..."
                     ),
+                )
+
+                source_data_url = self.image_to_data_url(
+                    current_image_path
                 )
 
                 output_path = (
@@ -521,18 +218,11 @@ class VeniceVideoWorker(QObject):
                 )
 
                 output_path.unlink(missing_ok=True)
-                self.track_intermediate_file(output_path)
-
-                source_data_url = None
-                if self.is_image_to_video:
-                    source_data_url = self.image_to_data_url(
-                        current_image_path
-                    )
 
                 self.generate_video_segment(
                     segment=segment,
-                    output_path=output_path,
                     source_data_url=source_data_url,
+                    output_path=output_path,
                 )
 
                 self.validate_media_file(
@@ -543,10 +233,8 @@ class VeniceVideoWorker(QObject):
                 segment_files.append(output_path)
                 self.segment_ready.emit(str(output_path))
 
-                if (
-                    self.is_image_to_video
-                    and segment.number < segment_count
-                ):
+                # Extract a continuation frame for the next generation.
+                if segment.number < SEGMENT_COUNT:
                     continuation_frame = (
                         self.destination_dir
                         / (
@@ -557,9 +245,6 @@ class VeniceVideoWorker(QObject):
                     )
 
                     continuation_frame.unlink(missing_ok=True)
-                    self.track_intermediate_file(
-                        continuation_frame
-                    )
 
                     self.progress.emit(
                         segment.number,
@@ -580,15 +265,15 @@ class VeniceVideoWorker(QObject):
                     segment.number,
                     (
                         f"Saved segment {segment.number} "
-                        f"of {segment_count}."
+                        f"of {SEGMENT_COUNT}."
                     ),
                 )
 
             self.output_file.unlink(missing_ok=True)
 
             self.progress.emit(
-                segment_count,
-                "Stitching the segments with FFmpeg...",
+                SEGMENT_COUNT,
+                "Stitching the four segments with FFmpeg...",
             )
 
             self.stitch_segments(
@@ -601,8 +286,6 @@ class VeniceVideoWorker(QObject):
                 "final video",
             )
 
-            self.cleanup_intermediate_files()
-
             self.finished.emit(str(self.output_file))
 
         except Exception as exc:
@@ -612,156 +295,6 @@ class VeniceVideoWorker(QObject):
 
         finally:
             self.session.close()
-
-    @property
-    def is_image_to_video(self):
-        """Return True when using image-to-video generation."""
-        return self.generation_mode == IMAGE_TO_VIDEO_MODE
-
-    @staticmethod
-    def plan_segment_durations(
-        total_seconds,
-        supported_durations=None,
-    ):
-        """Split requested seconds into supported segment durations."""
-        total_seconds = int(total_seconds)
-
-        allowed = []
-        for duration in supported_durations or ():
-            text = str(duration).strip().lower()
-            if not text.endswith("s"):
-                continue
-
-            try:
-                seconds = int(text[:-1])
-            except ValueError:
-                continue
-
-            if seconds > 0:
-                allowed.append(seconds)
-
-        if not allowed:
-            allowed = [15, 10, 5]
-
-        allowed = sorted(set(allowed), reverse=True)
-        possible = {0: []}
-
-        for seconds in range(1, total_seconds + 1):
-            best = None
-            for duration in allowed:
-                prior = possible.get(seconds - duration)
-                if prior is None:
-                    continue
-
-                candidate = prior + [duration]
-                if (
-                    best is None
-                    or len(candidate) < len(best)
-                    or candidate > best
-                ):
-                    best = candidate
-
-            if best is not None:
-                possible[seconds] = best
-
-        if total_seconds not in possible:
-            supported = ", ".join(f"{duration}s" for duration in allowed)
-            raise ValueError(
-                f"The selected model cannot generate exactly "
-                f"{total_seconds} seconds. Supported segment durations: "
-                f"{supported}."
-            )
-
-        return possible[total_seconds]
-
-    def track_intermediate_file(self, path):
-        """Track a temporary artifact for optional cleanup."""
-        path = Path(path)
-        if path not in self.intermediate_files:
-            self.intermediate_files.append(path)
-
-    def cleanup_intermediate_files(self):
-        """Delete intermediate artifacts when retention is disabled."""
-        if self.retain_intermediate_files:
-            self.progress.emit(
-                len(self.segment_durations),
-                "Retaining intermediate files.",
-            )
-            return
-
-        removed = 0
-        for path in self.intermediate_files:
-            try:
-                if path.exists():
-                    path.unlink()
-                    removed += 1
-            except OSError as exc:
-                self.progress.emit(
-                    len(self.segment_durations),
-                    (
-                        f"Could not delete intermediate file "
-                        f"{path.name}: {exc}"
-                    ),
-                )
-
-        self.progress.emit(
-            len(self.segment_durations),
-            f"Removed {removed} intermediate file(s).",
-        )
-
-    def quote_payload(self, duration_seconds):
-        """Return Venice video quote inputs for one segment."""
-        payload = {
-            "model": self.video_model,
-            "duration": f"{duration_seconds}s",
-        }
-
-        if self.video_resolution:
-            payload["resolution"] = self.video_resolution
-
-        if not self.is_image_to_video and self.video_aspect_ratio:
-            payload["aspect_ratio"] = self.video_aspect_ratio
-
-        return payload
-
-    def estimate_generation_cost(self):
-        """Log a Venice video quote total when the quote API is available."""
-        total = 0.0
-
-        try:
-            for duration_seconds in self.segment_durations:
-                data = self.post_json(
-                    VIDEO_QUOTE_URL,
-                    self.quote_payload(duration_seconds),
-                )
-                quote = self.find_first_value(
-                    data,
-                    {"quote", "cost", "price", "amount"},
-                )
-
-                if quote is None:
-                    raise RuntimeError(
-                        "The quote response did not include a quote."
-                    )
-
-                total += float(quote)
-
-        except (
-            VeniceAPIError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ) as exc:
-            self.progress.emit(
-                0,
-                f"Cost estimate unavailable: {exc}",
-            )
-            return
-
-        self.progress.emit(
-            0,
-            f"Estimated video generation cost: ${total:.4f}",
-        )
 
     # ------------------------------------------------------------------
     # Validation
@@ -881,7 +414,7 @@ class VeniceVideoWorker(QObject):
                     return value
 
             for value in data.values():
-                found = VeniceVideoWorker.find_first_value(
+                found = VeniceOneMinuteWorker.find_first_value(
                     value,
                     names,
                 )
@@ -891,7 +424,7 @@ class VeniceVideoWorker(QObject):
 
         elif isinstance(data, list):
             for item in data:
-                found = VeniceVideoWorker.find_first_value(
+                found = VeniceOneMinuteWorker.find_first_value(
                     item,
                     names,
                 )
@@ -948,6 +481,7 @@ class VeniceVideoWorker(QObject):
                 "assetUrl",
                 "result_url",
                 "resultUrl",
+                "url",
             },
         )
 
@@ -958,7 +492,7 @@ class VeniceVideoWorker(QObject):
     # ------------------------------------------------------------------
 
     def segment_story(self):
-        """Split the video concept into timed segment prompts."""
+        """Split the one-minute concept into four 15-second prompts."""
         payload = {
             "model": SEGMENT_MODEL,
             "messages": [
@@ -966,7 +500,7 @@ class VeniceVideoWorker(QObject):
                     "role": "system",
                     "content": (
                         "You create precise prompts for sequential "
-                        f"{self.generation_mode} generation. Return only valid JSON "
+                        "image-to-video generation. Return only valid JSON "
                         "without Markdown or commentary."
                     ),
                 },
@@ -976,13 +510,7 @@ class VeniceVideoWorker(QObject):
                 },
             ],
             "temperature": 0.6,
-            "max_tokens": min(
-                12000,
-                max(
-                    2400,
-                    len(self.segment_durations) * 700,
-                ),
-            ),
+            "max_tokens": 2400,
         }
 
         data = self.post_json(
@@ -1003,78 +531,21 @@ class VeniceVideoWorker(QObject):
 
     def segmentation_prompt(self):
         """Create the segmentation-model instruction."""
-        segment_count = len(self.segment_durations)
-        segment_lines = "\n".join(
-            (
-                f"- Segment {index}: {duration} seconds"
-            )
-            for index, duration in enumerate(
-                self.segment_durations,
-                start=1,
-            )
-        )
-        example_items = []
-        for index, duration in enumerate(
-            self.segment_durations,
-            start=1,
-        ):
-            final_note = (
-                "Description of the final shot."
-                if index == segment_count
-                else "Exact visual state of the final frame."
-            )
-            example_items.append(
-                "\n".join(
-                    [
-                        "  {",
-                        f'    "segment": {index},',
-                        (
-                            '    "description": '
-                            f'"Complete prompt for this {duration}-second segment.",'
-                        ),
-                        f'    "transition_note": "{final_note}"',
-                        "  }",
-                    ]
-                )
-            )
-        example_json = ",\n".join(example_items)
+        return f"""
+Divide the following one-minute video concept into exactly four sequential
+15-second image-to-video prompts.
 
-        if self.is_image_to_video:
-            mode_context = """
 The first segment starts from a reference image supplied separately.
 Each later segment starts from the extracted final frame of the preceding
 segment.
-""".strip()
-            mode_requirement = (
-                "Each description must work as an independent "
-                "image-to-video prompt."
-            )
-        else:
-            mode_context = (
-                "All segments are generated from text prompts only; "
-                "there is no source image."
-            )
-            mode_requirement = (
-                "Each description must work as an independent "
-                "text-to-video prompt."
-            )
-
-        return f"""
-Divide the following video concept into exactly {segment_count} sequential
-{self.generation_mode} prompts covering exactly {self.total_seconds} seconds.
-
-Segment durations:
-{segment_lines}
-
-{mode_context}
 
 Requirements:
 
-1. Return exactly {segment_count} segments.
-2. Each segment must describe action for its assigned duration.
+1. Return exactly four segments.
+2. Each segment must describe approximately 15 seconds of action.
 3. Segment 2 must continue directly from the end of segment 1.
-4. Each later segment must continue directly from the end of the prior segment.
-5. Do not skip or compress the requested timeline.
+4. Segment 3 must continue directly from the end of segment 2.
+5. Segment 4 must continue directly from the end of segment 3.
 6. Do not restart or recap the story in later segments.
 7. Repeat important character, clothing, environment, lighting, camera,
    lens, and visual-style details when needed for consistency.
@@ -1082,17 +553,37 @@ Requirements:
    composition, lighting, pacing, and the desired ending frame.
 9. Do not request captions, subtitles, logos, watermarks, or visible text.
 10. Segment 4 must end with a satisfying final shot.
-11. {mode_requirement}
+11. Each description must work as an independent Wan 2.7
+    image-to-video prompt.
 12. Do not mention API parameters, duration fields, or source-image URLs
     inside the descriptions.
 
 Return only a JSON array in exactly this form:
 
 [
-{example_json}
+  {{
+    "segment": 1,
+    "description": "Complete prompt for the first 15-second video.",
+    "transition_note": "Exact visual state of the final frame."
+  }},
+  {{
+    "segment": 2,
+    "description": "Complete prompt continuing from segment 1.",
+    "transition_note": "Exact visual state of the final frame."
+  }},
+  {{
+    "segment": 3,
+    "description": "Complete prompt continuing from segment 2.",
+    "transition_note": "Exact visual state of the final frame."
+  }},
+  {{
+    "segment": 4,
+    "description": "Complete prompt continuing from segment 3.",
+    "transition_note": "Description of the final shot."
+  }}
 ]
 
-Original video concept:
+Original one-minute concept:
 
 {self.prompt}
 """.strip()
@@ -1139,10 +630,10 @@ Original video concept:
                 "The segmentation response must be a JSON array."
             )
 
-        if len(data) != len(self.segment_durations):
+        if len(data) != SEGMENT_COUNT:
             raise ValueError(
                 f"The segmentation response contained {len(data)} "
-                f"segments instead of {len(self.segment_durations)}."
+                f"segments instead of {SEGMENT_COUNT}."
             )
 
         segments = []
@@ -1173,9 +664,6 @@ Original video concept:
             segments.append(
                 Segment(
                     number=expected_number,
-                    duration_seconds=self.segment_durations[
-                        expected_number - 1
-                    ],
                     description=description,
                     transition_note=transition_note,
                 )
@@ -1188,9 +676,7 @@ Original video concept:
         data = [
             {
                 "segment": segment.number,
-                "mode": self.generation_mode,
-                "model": self.video_model,
-                "duration": segment.duration,
+                "duration": VIDEO_DURATION,
                 "description": segment.description,
                 "transition_note": segment.transition_note,
             }
@@ -1210,7 +696,6 @@ Original video concept:
             ),
             encoding="utf-8",
         )
-        self.track_intermediate_file(output_path)
 
     # ------------------------------------------------------------------
     # Image handling
@@ -1261,7 +746,7 @@ Original video concept:
                 "25 MB size limit."
             )
 
-        mime_type = VeniceVideoWorker.detect_image_mime_type(
+        mime_type = VeniceOneMinuteWorker.detect_image_mime_type(
             path
         )
 
@@ -1286,64 +771,42 @@ Original video concept:
                 "FFmpeg is required to extract continuation frames."
             )
 
-        errors = []
-
-        commands = [
-            [
-                ffmpeg_path,
-                "-y",
-                "-sseof",
-                "-0.50",
-                "-i",
-                str(video_path),
-                "-map",
-                "0:v:0",
-                "-frames:v",
-                "1",
-                "-q:v",
-                "2",
-                str(output_path),
-            ],
-            [
-                ffmpeg_path,
-                "-y",
-                "-i",
-                str(video_path),
-                "-map",
-                "0:v:0",
-                "-vf",
-                "reverse",
-                "-frames:v",
-                "1",
-                "-q:v",
-                "2",
-                str(output_path),
-            ],
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-sseof",
+            "-0.10",
+            "-i",
+            str(video_path),
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            str(output_path),
         ]
 
-        for command in commands:
-            output_path.unlink(missing_ok=True)
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
-            result = subprocess.run(
-                command,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
+        if result.returncode != 0:
+            raise RuntimeError(
+                "FFmpeg could not extract the final frame.\n\n"
+                f"{result.stderr[-6000:]}"
             )
 
-            if (
-                result.returncode == 0
-                and output_path.exists()
-                and output_path.stat().st_size > 0
-            ):
-                return
-
-            errors.append(result.stderr[-3000:])
-
-        raise RuntimeError(
-            "FFmpeg could not extract a continuation frame.\n\n"
-            + "\n\n".join(errors)[-6000:]
-        )
+        if (
+            not output_path.exists()
+            or output_path.stat().st_size == 0
+        ):
+            raise RuntimeError(
+                "FFmpeg completed without creating a continuation frame."
+            )
 
     # ------------------------------------------------------------------
     # Video generation
@@ -1352,25 +815,21 @@ Original video concept:
     def generate_video_segment(
         self,
         segment,
+        source_data_url,
         output_path,
-        source_data_url=None,
     ):
-        """Queue, poll, download, and save one video segment."""
+        """Queue, poll, download, and save one Wan 2.7 segment."""
         payload = {
-            "model": self.video_model,
+            "model": VIDEO_MODEL,
             "prompt": segment.description,
-            "duration": segment.duration,
+            "duration": VIDEO_DURATION,
+            "resolution": VIDEO_RESOLUTION,
+            "image_url": source_data_url,
         }
 
-        if self.video_resolution:
-            payload["resolution"] = self.video_resolution
-
-        if self.is_image_to_video:
-            payload["image_url"] = source_data_url
-        elif self.video_aspect_ratio:
-            payload["aspect_ratio"] = self.video_aspect_ratio
-
-        # Deliberately omitted: audio, because model support varies.
+        # Deliberately omitted:
+        # - aspect_ratio: unsupported by this model
+        # - audio: native audio can already be embedded in the output
 
         self.progress.emit(
             segment.number - 1,
@@ -1386,17 +845,15 @@ Original video concept:
         )
 
         queue_id = self.get_queue_id(queue_data)
-        queued_model = str(
-            queue_data.get("model") or self.video_model
-        )
-        queued_download_url = self.get_download_url(
-            queue_data
-        )
 
         if not queue_id:
-            if queued_download_url:
+            immediate_url = self.get_download_url(
+                queue_data
+            )
+
+            if immediate_url:
                 self.download_video(
-                    queued_download_url,
+                    immediate_url,
                     output_path,
                 )
                 return
@@ -1419,8 +876,6 @@ Original video concept:
             queue_id=queue_id,
             segment=segment,
             output_path=output_path,
-            queued_model=queued_model,
-            queued_download_url=queued_download_url,
         )
 
     def poll_video_job(
@@ -1428,8 +883,6 @@ Original video concept:
         queue_id,
         segment,
         output_path,
-        queued_model,
-        queued_download_url,
     ):
         """Poll Venice until a queued video is available."""
         deadline = (
@@ -1438,7 +891,7 @@ Original video concept:
         )
 
         payload = {
-            "model": queued_model,
+            "model": VIDEO_MODEL,
             "queue_id": queue_id,
         }
 
@@ -1627,10 +1080,7 @@ Original video concept:
 
             download_url = self.get_download_url(data)
 
-            if download_url or (
-                queued_download_url
-                and status in COMPLETED_STATUSES
-            ):
+            if download_url:
                 self.progress.emit(
                     segment.number - 1,
                     (
@@ -1640,7 +1090,7 @@ Original video concept:
                 )
 
                 self.download_video(
-                    download_url or queued_download_url,
+                    download_url,
                     output_path,
                 )
 
@@ -1677,7 +1127,7 @@ Original video concept:
         url = str(url)
 
         if url.startswith("data:"):
-            VeniceVideoWorker.write_data_url(
+            VeniceOneMinuteWorker.write_data_url(
                 url,
                 output_path,
             )
@@ -1924,11 +1374,11 @@ class PromptEdit(QTextEdit):
 
         self.setAcceptRichText(False)
         self.setPlaceholderText(
-            "Describe the complete video..."
+            "Describe the complete one-minute video..."
         )
 
 
-class VideoWindow(QMainWindow):
+class OneMinuteWindow(QMainWindow):
     """Main GUI window."""
 
     def __init__(self):
@@ -1936,33 +1386,20 @@ class VideoWindow(QMainWindow):
 
         self.thread = None
         self.worker = None
-        self.model_thread = None
-        self.model_worker = None
-        self.generating = False
 
         self.api_key = os.environ.get(
             "VENICE_API_KEY",
             "",
         ).strip()
-        self.settings = QSettings(
-            SETTINGS_ORG,
-            SETTINGS_APP,
-        )
 
         self.setWindowTitle(
-            "Venice AI Video"
+            "Venice Wan 2.7 One-Minute Video"
         )
         self.resize(980, 720)
 
         self.source_file_edit = QLineEdit()
         self.source_file_edit.setPlaceholderText(
-            "Required for image-to-video"
-        )
-        self.source_file_edit.setText(
-            self.load_starting_image_path()
-        )
-        self.source_file_edit.textChanged.connect(
-            self.save_starting_image_path
+            "Required reference image for segment 1"
         )
 
         self.source_file_button = QPushButton(
@@ -1984,63 +1421,7 @@ class VideoWindow(QMainWindow):
             self.choose_output_file
         )
 
-        self.output_seconds_spin = QSpinBox()
-        self.output_seconds_spin.setRange(1, 3600)
-        self.output_seconds_spin.setSingleStep(5)
-        self.output_seconds_spin.setValue(60)
-        self.output_seconds_spin.setSuffix(" seconds")
-
-        self.retain_intermediate_checkbox = QCheckBox(
-            "Retain intermediate files"
-        )
-        self.retain_intermediate_checkbox.setChecked(
-            self.load_retain_intermediate_files()
-        )
-        self.retain_intermediate_checkbox.stateChanged.connect(
-            self.save_retain_intermediate_files
-        )
-
-        self.generation_mode_combo = QComboBox()
-        self.generation_mode_combo.addItem(
-            "Image-to-video",
-            IMAGE_TO_VIDEO_MODE,
-        )
-        self.generation_mode_combo.addItem(
-            "Text-to-video",
-            TEXT_TO_VIDEO_MODE,
-        )
-        self.generation_mode_combo.currentIndexChanged.connect(
-            self.generation_mode_changed
-        )
-
-        self.video_model_combo = QComboBox()
-        self.video_model_combo.addItem(
-            DEFAULT_IMAGE_VIDEO_MODEL,
-            DEFAULT_IMAGE_VIDEO_MODEL,
-        )
-
-        self.refresh_models_button = QPushButton(
-            "Refresh Models"
-        )
-        self.refresh_models_button.clicked.connect(
-            self.load_video_models
-        )
-
         self.prompt_input = PromptEdit()
-
-        self.load_prompt_button = QPushButton(
-            "Load Prompt"
-        )
-        self.load_prompt_button.clicked.connect(
-            self.load_prompt_text
-        )
-
-        self.save_prompt_button = QPushButton(
-            "Save Prompt"
-        )
-        self.save_prompt_button.clicked.connect(
-            self.save_prompt_text
-        )
 
         self.log_display = QTextBrowser()
         self.log_display.setReadOnly(True)
@@ -2048,11 +1429,7 @@ class VideoWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(
             0,
-            len(
-                VeniceVideoWorker.plan_segment_durations(
-                    self.output_seconds_spin.value()
-                )
-            ),
+            SEGMENT_COUNT,
         )
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat(
@@ -2076,7 +1453,7 @@ class VideoWindow(QMainWindow):
 
         QTimer.singleShot(
             0,
-            self.startup,
+            self.ensure_api_key,
         )
 
     def build_layout(self):
@@ -2099,24 +1476,7 @@ class VideoWindow(QMainWindow):
             self.output_file_button
         )
 
-        model_row = QHBoxLayout()
-        model_row.addWidget(
-            self.video_model_combo,
-            1,
-        )
-        model_row.addWidget(
-            self.refresh_models_button
-        )
-
         form = QFormLayout()
-        form.addRow(
-            "Mode",
-            self.generation_mode_combo,
-        )
-        form.addRow(
-            "Video model",
-            model_row,
-        )
         form.addRow(
             "Starting image",
             source_row,
@@ -2125,14 +1485,6 @@ class VideoWindow(QMainWindow):
             "Output MP4",
             output_row,
         )
-        form.addRow(
-            "Output length",
-            self.output_seconds_spin,
-        )
-        form.addRow(
-            "",
-            self.retain_intermediate_checkbox,
-        )
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
@@ -2140,22 +1492,10 @@ class VideoWindow(QMainWindow):
             self.generate_button
         )
 
-        prompt_button_row = QHBoxLayout()
-        prompt_button_row.addStretch(1)
-        prompt_button_row.addWidget(
-            self.load_prompt_button
-        )
-        prompt_button_row.addWidget(
-            self.save_prompt_button
-        )
-
         layout = QVBoxLayout()
         layout.addLayout(form)
         layout.addWidget(
-            QLabel("Video prompt")
-        )
-        layout.addLayout(
-            prompt_button_row
+            QLabel("One-minute prompt")
         )
         layout.addWidget(
             self.prompt_input,
@@ -2197,7 +1537,6 @@ class VideoWindow(QMainWindow):
             }
 
             QLineEdit,
-            QComboBox,
             QTextBrowser,
             QTextEdit {
                 background: #2f3136;
@@ -2247,19 +1586,10 @@ class VideoWindow(QMainWindow):
 
     def choose_source_file(self):
         """Choose the starting reference image."""
-        current_path = Path(
-            self.source_file_edit.text().strip()
-        )
-        start_directory = (
-            str(current_path.parent)
-            if current_path.parent.exists()
-            else ""
-        )
-
         filename, _ = QFileDialog.getOpenFileName(
             self,
             "Choose starting image",
-            start_directory,
+            "",
             (
                 "Image files "
                 "(*.png *.jpg *.jpeg *.webp);;"
@@ -2271,7 +1601,6 @@ class VideoWindow(QMainWindow):
             self.source_file_edit.setText(
                 filename
             )
-            self.save_starting_image_path()
 
     def choose_output_file(self):
         """Choose the final MP4 output path."""
@@ -2291,103 +1620,6 @@ class VideoWindow(QMainWindow):
             self.output_file_edit.setText(
                 str(path)
             )
-
-    def load_prompt_text(self):
-        """Load prompt text from a plain-text file."""
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            "Load prompt",
-            self.load_prompt_directory(),
-            "Text files (*.txt);;Markdown files (*.md);;All files (*)",
-        )
-
-        if not filename:
-            return
-
-        path = Path(filename)
-
-        try:
-            text = path.read_text(
-                encoding="utf-8"
-            )
-        except UnicodeDecodeError:
-            text = path.read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
-        except OSError as exc:
-            QMessageBox.critical(
-                self,
-                "Load prompt failed",
-                f"Could not read prompt file:\n{path}\n\n{exc}",
-            )
-            return
-
-        self.prompt_input.setPlainText(text)
-        self.save_prompt_directory(path.parent)
-        self.status_label.setText(
-            f"Loaded prompt: {path.name}"
-        )
-
-    def save_prompt_text(self):
-        """Save the current prompt text to a plain-text file."""
-        prompt = self.prompt_input.toPlainText()
-
-        filename, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save prompt",
-            self.load_prompt_directory(),
-            "Text files (*.txt);;Markdown files (*.md);;All files (*)",
-        )
-
-        if not filename:
-            return
-
-        path = Path(filename)
-
-        if not path.suffix:
-            path = path.with_suffix(".txt")
-
-        try:
-            path.write_text(
-                prompt,
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            QMessageBox.critical(
-                self,
-                "Save prompt failed",
-                f"Could not write prompt file:\n{path}\n\n{exc}",
-            )
-            return
-
-        self.save_prompt_directory(path.parent)
-        self.status_label.setText(
-            f"Saved prompt: {path.name}"
-        )
-
-    def load_prompt_directory(self):
-        """Return the persisted prompt file directory."""
-        directory = str(
-            self.settings.value(
-                PROMPT_DIRECTORY_KEY,
-                "",
-            )
-            or ""
-        )
-
-        if directory and Path(directory).is_dir():
-            return directory
-
-        return ""
-
-    def save_prompt_directory(self, directory):
-        """Persist the prompt file directory."""
-        self.settings.setValue(
-            PROMPT_DIRECTORY_KEY,
-            str(directory),
-        )
-        self.settings.sync()
 
     def ensure_api_key(self):
         """Load or request the Venice API key."""
@@ -2416,257 +1648,6 @@ class VideoWindow(QMainWindow):
 
         return False
 
-    def load_retain_intermediate_files(self):
-        """Return the persisted intermediate-file retention setting."""
-        value = self.settings.value(
-            RETAIN_INTERMEDIATE_FILES_KEY,
-            False,
-        )
-
-        if isinstance(value, bool):
-            return value
-
-        return str(value).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-
-    def save_retain_intermediate_files(self, *_args):
-        """Persist the intermediate-file retention setting."""
-        self.settings.setValue(
-            RETAIN_INTERMEDIATE_FILES_KEY,
-            self.retain_intermediate_checkbox.isChecked(),
-        )
-        self.settings.sync()
-
-    def load_starting_image_path(self):
-        """Return the persisted starting image path."""
-        return str(
-            self.settings.value(
-                STARTING_IMAGE_PATH_KEY,
-                "",
-            )
-            or ""
-        )
-
-    def save_starting_image_path(self, *_args):
-        """Persist the starting image path."""
-        self.settings.setValue(
-            STARTING_IMAGE_PATH_KEY,
-            self.source_file_edit.text().strip(),
-        )
-        self.settings.sync()
-
-    def startup(self):
-        """Load session prerequisites after the window is visible."""
-        self.update_source_controls()
-        if self.ensure_api_key():
-            self.load_video_models()
-
-    def selected_generation_mode(self):
-        """Return the selected generation mode."""
-        mode = self.generation_mode_combo.currentData()
-        return str(mode or IMAGE_TO_VIDEO_MODE)
-
-    def default_video_model(self):
-        """Return the default model for the selected generation mode."""
-        if self.selected_generation_mode() == TEXT_TO_VIDEO_MODE:
-            return DEFAULT_TEXT_VIDEO_MODEL
-
-        return DEFAULT_IMAGE_VIDEO_MODEL
-
-    def generation_mode_changed(self):
-        """Handle image/text video mode changes."""
-        self.video_model_combo.clear()
-        default_model = self.default_video_model()
-        self.video_model_combo.addItem(
-            default_model,
-            default_model,
-        )
-        self.update_source_controls()
-        self.load_video_models()
-
-    def update_source_controls(self):
-        """Enable source-image controls only when the mode needs them."""
-        is_image_mode = (
-            self.selected_generation_mode()
-            == IMAGE_TO_VIDEO_MODE
-        )
-
-        self.source_file_edit.setEnabled(
-            is_image_mode and not self.generating
-        )
-        self.source_file_button.setEnabled(
-            is_image_mode and not self.generating
-        )
-
-        if is_image_mode:
-            self.source_file_edit.setPlaceholderText(
-                "Required reference image for segment 1"
-            )
-        else:
-            self.source_file_edit.setPlaceholderText(
-                "Not used in text-to-video mode"
-            )
-
-    def load_video_models(self):
-        """Load current video models into the dropdown."""
-        if self.model_thread is not None:
-            return
-
-        if not self.ensure_api_key():
-            return
-
-        generation_mode = self.selected_generation_mode()
-
-        self.status_label.setText(
-            f"Loading {generation_mode} models..."
-        )
-        self.refresh_models_button.setDisabled(True)
-
-        current_model = self.selected_video_model()
-
-        self.model_thread = QThread(self)
-        self.model_worker = VeniceVideoModelsWorker(
-            self.api_key,
-            generation_mode,
-        )
-        self.model_worker.current_model = current_model
-
-        self.model_worker.moveToThread(
-            self.model_thread
-        )
-
-        self.model_thread.started.connect(
-            self.model_worker.run
-        )
-
-        self.model_worker.finished.connect(
-            self.video_models_loaded
-        )
-
-        self.model_worker.failed.connect(
-            self.video_models_failed
-        )
-
-        self.model_worker.finished.connect(
-            self.model_thread.quit
-        )
-
-        self.model_worker.failed.connect(
-            self.model_thread.quit
-        )
-
-        self.model_thread.finished.connect(
-            self.model_worker.deleteLater
-        )
-
-        self.model_thread.finished.connect(
-            self.model_thread.deleteLater
-        )
-
-        self.model_thread.finished.connect(
-            self.clear_model_worker
-        )
-
-        self.model_thread.start()
-
-    def video_models_loaded(self, options, message):
-        """Populate the video model dropdown with API results."""
-        current_model = self.selected_video_model()
-
-        self.video_model_combo.clear()
-
-        for option in options:
-            self.video_model_combo.addItem(
-                option.label,
-                option,
-            )
-
-        index = self.find_video_model_index(
-            current_model
-        )
-
-        if index < 0:
-            index = self.find_video_model_index(
-                self.default_video_model()
-            )
-
-        if index >= 0:
-            self.video_model_combo.setCurrentIndex(index)
-
-        self.status_label.setText(message)
-        self.append_log(message)
-
-    def video_models_failed(self, message):
-        """Report model-loading failures while preserving fallback model."""
-        self.status_label.setText(
-            "Could not load video models."
-        )
-        self.append_log(
-            f"Model load error: {message}"
-        )
-
-    def clear_model_worker(self):
-        """Clear model-loader references after thread termination."""
-        self.model_thread = None
-        self.model_worker = None
-        if self.thread is None:
-            self.refresh_models_button.setDisabled(False)
-
-    def find_video_model_index(self, model_id):
-        """Find a model option by model ID."""
-        for index in range(self.video_model_combo.count()):
-            option = self.video_model_combo.itemData(index)
-            if isinstance(option, VideoModelOption):
-                if option.model_id == model_id:
-                    return index
-            elif option == model_id:
-                return index
-
-        return -1
-
-    def selected_video_option(self):
-        """Return the selected model option with constraints."""
-        option = self.video_model_combo.currentData()
-        if isinstance(option, VideoModelOption):
-            return option
-
-        model_id = (
-            str(option).strip()
-            if option
-            else self.video_model_combo.currentText().strip()
-        )
-
-        if not model_id:
-            model_id = self.default_video_model()
-
-        return VideoModelOption(
-            model_id=model_id,
-            label=model_id,
-            durations=("15s", "10s", "5s"),
-            resolutions=(VIDEO_RESOLUTION, "720p"),
-            aspect_ratios=(VIDEO_ASPECT_RATIO,),
-        )
-
-    def selected_video_model(self):
-        """Return the selected Venice video model ID."""
-        return self.selected_video_option().model_id
-
-    @staticmethod
-    def choose_preferred_value(values, preferred):
-        """Return a preferred supported value or the first supported value."""
-        values = tuple(value for value in values if value)
-        if not values:
-            return None
-
-        if preferred in values:
-            return preferred
-
-        return values[0]
-
     def generate(self):
         """Validate input and start generation."""
         if self.thread is not None:
@@ -2684,67 +1665,6 @@ class VideoWindow(QMainWindow):
             .strip()
         )
 
-        generation_mode = self.selected_generation_mode()
-        video_option = self.selected_video_option()
-        video_model = video_option.model_id
-        total_seconds = self.output_seconds_spin.value()
-        try:
-            segment_durations = (
-                VeniceVideoWorker.plan_segment_durations(
-                    total_seconds,
-                    video_option.durations,
-                )
-            )
-        except ValueError as exc:
-            QMessageBox.warning(
-                self,
-                "Unsupported video length",
-                str(exc),
-            )
-            return
-
-        video_resolution = self.choose_preferred_value(
-            video_option.resolutions,
-            VIDEO_RESOLUTION,
-        )
-        video_aspect_ratio = self.choose_preferred_value(
-            video_option.aspect_ratios,
-            VIDEO_ASPECT_RATIO,
-        )
-
-        if (
-            generation_mode == TEXT_TO_VIDEO_MODE
-            and video_option.aspect_ratios
-            and not video_aspect_ratio
-        ):
-            QMessageBox.warning(
-                self,
-                "Unsupported aspect ratio",
-                (
-                    "The selected text-to-video model does not support "
-                    f"{VIDEO_ASPECT_RATIO}."
-                ),
-            )
-            return
-
-        if (
-            video_option.resolutions
-            and not video_resolution
-        ):
-            QMessageBox.warning(
-                self,
-                "Unsupported resolution",
-                (
-                    "The selected video model does not support "
-                    f"{VIDEO_RESOLUTION} or a usable fallback."
-                ),
-            )
-            return
-
-        retain_intermediate_files = (
-            self.retain_intermediate_checkbox.isChecked()
-        )
-
         output_file = (
             self.output_file_edit
             .text()
@@ -2754,18 +1674,20 @@ class VideoWindow(QMainWindow):
         if not self.ensure_api_key():
             return
 
-        if generation_mode == IMAGE_TO_VIDEO_MODE and not source_file:
+        if not source_file:
             QMessageBox.warning(
                 self,
                 "Missing starting image",
                 (
-                    "Image-to-video mode requires a starting "
-                    "reference image."
+                    "Wan 2.7 image-to-video requires "
+                    "a starting reference image."
                 ),
             )
             return
 
-        if source_file and not Path(source_file).is_file():
+        source_path = Path(source_file)
+
+        if not source_path.is_file():
             QMessageBox.warning(
                 self,
                 "Invalid starting image",
@@ -2777,15 +1699,7 @@ class VideoWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Missing prompt",
-                "Enter a video prompt.",
-            )
-            return
-
-        if not video_model:
-            QMessageBox.warning(
-                self,
-                "Missing video model",
-                "Choose a video model first.",
+                "Enter a one-minute video prompt.",
             )
             return
 
@@ -2804,10 +1718,6 @@ class VideoWindow(QMainWindow):
             self.output_file_edit.setText(str(output_path))
 
         self.log_display.clear()
-        self.progress_bar.setRange(
-            0,
-            len(segment_durations),
-        )
         self.progress_bar.setValue(0)
         self.set_generating(True)
 
@@ -2815,61 +1725,20 @@ class VideoWindow(QMainWindow):
             f"Text model: {SEGMENT_MODEL}"
         )
         self.append_log(
-            f"Video model: {video_model}"
+            f"Video model: {VIDEO_MODEL}"
         )
         self.append_log(
-            (
-                f"Plan: {total_seconds} seconds across "
-                f"{len(segment_durations)} segment(s): "
-                + ", ".join(
-                    f"{duration}s"
-                    for duration in segment_durations
-                )
-            )
+            f"Plan: {SEGMENT_COUNT} × {VIDEO_DURATION} "
+            f"at {VIDEO_RESOLUTION}"
         )
         self.append_log(
-            "Resolution: " + (video_resolution or "model default")
+            "Aspect ratio: derived from source image"
         )
-        if (
-            video_resolution
-            and video_resolution != VIDEO_RESOLUTION
-        ):
-            self.append_log(
-                (
-                    f"Selected model does not support {VIDEO_RESOLUTION}; "
-                    f"using {video_resolution}."
-                )
-            )
         self.append_log(
-            f"Mode: {generation_mode}"
+            "Audio field: omitted; embedded native audio is preserved"
         )
-        if generation_mode == TEXT_TO_VIDEO_MODE:
-            self.append_log(
-                "Aspect ratio: "
-                + (video_aspect_ratio or "model default")
-            )
-        else:
-            self.append_log(
-                "Aspect ratio: derived from source image"
-            )
         self.append_log(
-            "Audio field: omitted; model default is used"
-        )
-        if generation_mode == IMAGE_TO_VIDEO_MODE:
-            self.append_log(
-                "Continuity: each segment uses the preceding final frame"
-            )
-        else:
-            self.append_log(
-                "Continuity: each segment prompt continues the previous one"
-            )
-        self.append_log(
-            "Intermediate files: "
-            + (
-                "retained"
-                if retain_intermediate_files
-                else "removed after final MP4 is saved"
-            )
+            "Continuity: each segment uses the preceding final frame"
         )
         self.append_log(
             "Starting generation..."
@@ -2877,18 +1746,11 @@ class VideoWindow(QMainWindow):
 
         self.thread = QThread(self)
 
-        self.worker = VeniceVideoWorker(
+        self.worker = VeniceOneMinuteWorker(
             api_key=self.api_key,
             prompt=prompt,
             source_file=source_file,
             output_file=str(output_path),
-            video_model=video_model,
-            generation_mode=generation_mode,
-            total_seconds=total_seconds,
-            segment_durations=segment_durations,
-            video_resolution=video_resolution,
-            video_aspect_ratio=video_aspect_ratio,
-            retain_intermediate_files=retain_intermediate_files,
         )
 
         self.worker.moveToThread(
@@ -2952,7 +1814,7 @@ class VideoWindow(QMainWindow):
     def generation_finished(self, final_path):
         """Handle successful generation."""
         self.progress_bar.setValue(
-            self.progress_bar.maximum()
+            SEGMENT_COUNT
         )
 
         self.status_label.setText(
@@ -2993,13 +1855,14 @@ class VideoWindow(QMainWindow):
         """Clear worker references after thread termination."""
         self.thread = None
         self.worker = None
-        self.update_source_controls()
 
     def set_generating(self, generating):
         """Enable or disable controls."""
-        self.generating = generating
-
         self.generate_button.setDisabled(
+            generating
+        )
+
+        self.source_file_button.setDisabled(
             generating
         )
 
@@ -3007,43 +1870,17 @@ class VideoWindow(QMainWindow):
             generating
         )
 
+        self.source_file_edit.setDisabled(
+            generating
+        )
+
         self.output_file_edit.setDisabled(
-            generating
-        )
-
-        self.output_seconds_spin.setDisabled(
-            generating
-        )
-
-        self.generation_mode_combo.setDisabled(
-            generating
-        )
-
-        self.video_model_combo.setDisabled(
-            generating
-        )
-
-        self.refresh_models_button.setDisabled(
-            generating or self.model_thread is not None
-        )
-
-        self.retain_intermediate_checkbox.setDisabled(
             generating
         )
 
         self.prompt_input.setDisabled(
             generating
         )
-
-        self.load_prompt_button.setDisabled(
-            generating
-        )
-
-        self.save_prompt_button.setDisabled(
-            generating
-        )
-
-        self.update_source_controls()
 
     def append_log(self, message):
         """Append a line to the status log."""
@@ -3069,22 +1906,6 @@ class VideoWindow(QMainWindow):
             event.ignore()
             return
 
-        if (
-            self.model_thread is not None
-            and self.model_thread.isRunning()
-        ):
-            QMessageBox.warning(
-                self,
-                "Model loading in progress",
-                (
-                    "Wait for model loading to finish "
-                    "before closing the application."
-                ),
-            )
-
-            event.ignore()
-            return
-
         event.accept()
 
 
@@ -3096,7 +1917,7 @@ def main():
     """Start the GUI application."""
     app = QApplication(sys.argv)
 
-    window = VideoWindow()
+    window = OneMinuteWindow()
     window.show()
 
     sys.exit(app.exec())

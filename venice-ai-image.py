@@ -3,20 +3,24 @@
 
 import base64
 import json
+import struct
 import sys
+import zlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import requests
 from PySide6.QtCore import QObject, QSettings, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QPixmap
+from PySide6.QtGui import QAction, QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -25,6 +29,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QTextEdit,
@@ -45,6 +50,7 @@ HTTP_TIMEOUT = (30, 240)
 SETTINGS_ORG = "VeniceAI"
 SETTINGS_APP = "ImageGeneration"
 OUTPUT_DIR_SETTING = "paths/output_dir"
+PROMPT_DIR_SETTING = "paths/prompt_dir"
 
 SIZING_WIDTH_HEIGHT = "width_height"
 SIZING_ASPECT_RATIO = "aspect_ratio"
@@ -55,6 +61,7 @@ FORMAT_EXTENSIONS = {
     "png": "png",
     "webp": "webp",
 }
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 @dataclass
@@ -163,6 +170,45 @@ def decode_image_data(value):
     return base64.b64decode(image_data, validate=True)
 
 
+def png_chunk(chunk_type, payload):
+    """Return one encoded PNG chunk."""
+    return (
+        struct.pack(">I", len(payload))
+        + chunk_type
+        + payload
+        + struct.pack(">I", zlib.crc32(chunk_type + payload) & 0xffffffff)
+    )
+
+
+def add_png_description(image_bytes, description):
+    """Return PNG bytes with a Description iTXt chunk inserted before IEND."""
+    if not description or not image_bytes.startswith(PNG_SIGNATURE):
+        return image_bytes
+
+    offset = len(PNG_SIGNATURE)
+    while offset + 12 <= len(image_bytes):
+        chunk_length = struct.unpack(">I", image_bytes[offset:offset + 4])[0]
+        chunk_type = image_bytes[offset + 4:offset + 8]
+        chunk_end = offset + 12 + chunk_length
+        if chunk_end > len(image_bytes):
+            return image_bytes
+
+        if chunk_type == b"IEND":
+            payload = (
+                b"Description\x00"
+                b"\x00"
+                b"\x00"
+                b"\x00"
+                b"\x00"
+                + description.encode("utf-8")
+            )
+            return image_bytes[:offset] + png_chunk(b"iTXt", payload) + image_bytes[offset:]
+
+        offset = chunk_end
+
+    return image_bytes
+
+
 class MetadataWorker(QObject):
     """Load model and style metadata without blocking the GUI."""
 
@@ -219,13 +265,14 @@ class ImageGenerationWorker(QObject):
     finished = Signal(object, str)
     failed = Signal(str)
 
-    def __init__(self, api_key, payload, output_dir, filename_prefix, output_format):
+    def __init__(self, api_key, payload, output_dir, filename_prefix, output_format, description):
         super().__init__()
         self.api_key = api_key
         self.payload = payload
         self.output_dir = Path(output_dir)
         self.filename_prefix = filename_prefix
         self.output_format = output_format
+        self.description = description
 
     def run(self):
         """Call Venice image generation and save returned image variants."""
@@ -260,6 +307,8 @@ class ImageGenerationWorker(QObject):
                 image_bytes = decode_image_data(image)
                 suffix = f"-{index}" if len(images) > 1 else ""
                 output_path = self.output_dir / f"{self.filename_prefix}-{timestamp}{suffix}.{extension}"
+                if extension == "png" and self.description:
+                    image_bytes = add_png_description(image_bytes, self.description)
                 output_path.write_bytes(image_bytes)
                 paths.append(str(output_path))
 
@@ -282,7 +331,8 @@ class ImageGenerationWindow(QMainWindow):
         self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
         self.setWindowTitle("Venice AI Image Generator")
-        self.resize(1120, 780)
+        self.resize(1280, 720)
+        self.build_menu()
 
         self.api_key_edit = QLineEdit(get_venice_api_key() or "")
         self.api_key_edit.setEchoMode(QLineEdit.Password)
@@ -292,25 +342,34 @@ class ImageGenerationWindow(QMainWindow):
         self.model_combo.setEditable(True)
         self.model_combo.addItem(DEFAULT_MODEL, DEFAULT_MODEL)
 
-        self.refresh_button = QPushButton("Refresh Models")
+        self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.refresh_metadata)
 
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setAcceptRichText(False)
+        self.prompt_edit.setMinimumHeight(150)
         self.prompt_edit.setPlaceholderText("Describe the image to generate.")
 
         self.negative_prompt_edit = QTextEdit()
         self.negative_prompt_edit.setAcceptRichText(False)
-        self.negative_prompt_edit.setMaximumHeight(90)
+        self.negative_prompt_edit.setMaximumHeight(70)
         self.negative_prompt_edit.setPlaceholderText("Optional negative prompt.")
+
+        self.description_check = QCheckBox("Add PNG description metadata")
+        self.description_check.toggled.connect(self.update_description_controls)
+
+        self.description_edit = QTextEdit()
+        self.description_edit.setAcceptRichText(False)
+        self.description_edit.setMaximumHeight(70)
+        self.description_edit.setPlaceholderText("Description saved as PNG metadata when the output format is PNG.")
 
         self.style_combo = QComboBox()
         self.style_combo.addItem("None", "")
 
         self.sizing_mode_combo = QComboBox()
-        self.sizing_mode_combo.addItem("Width and height", SIZING_WIDTH_HEIGHT)
+        self.sizing_mode_combo.addItem("Size", SIZING_WIDTH_HEIGHT)
         self.sizing_mode_combo.addItem("Aspect ratio", SIZING_ASPECT_RATIO)
-        self.sizing_mode_combo.addItem("Resolution and aspect ratio", SIZING_RESOLUTION_ASPECT)
+        self.sizing_mode_combo.addItem("Res + aspect", SIZING_RESOLUTION_ASPECT)
         self.sizing_mode_combo.currentIndexChanged.connect(self.update_sizing_controls)
 
         self.width_spin = QSpinBox()
@@ -353,7 +412,7 @@ class ImageGenerationWindow(QMainWindow):
         self.seed_spin.setValue(0)
 
         self.safe_mode_check = QCheckBox("Safe mode")
-        self.safe_mode_check.setChecked(True)
+        self.safe_mode_check.setChecked(False)
         self.hide_watermark_check = QCheckBox("Hide watermark")
         self.enhance_prompt_check = QCheckBox("Enhance prompt")
         self.embed_exif_check = QCheckBox("Embed EXIF metadata")
@@ -362,7 +421,7 @@ class ImageGenerationWindow(QMainWindow):
         self.output_dir_edit.setReadOnly(True)
         self.output_dir_edit.setText(self.settings.value(OUTPUT_DIR_SETTING, "", str))
 
-        self.output_dir_button = QPushButton("Choose Output Directory")
+        self.output_dir_button = QPushButton("Choose")
         self.output_dir_button.clicked.connect(self.choose_output_dir)
 
         self.filename_prefix_edit = QLineEdit("venice-image")
@@ -383,7 +442,7 @@ class ImageGenerationWindow(QMainWindow):
 
         self.preview_label = QLabel("Generated image preview")
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumSize(520, 420)
+        self.preview_label.setMinimumSize(320, 240)
 
         self.output_list = QListWidget()
         self.output_list.currentRowChanged.connect(self.preview_selected_image)
@@ -391,6 +450,26 @@ class ImageGenerationWindow(QMainWindow):
         self.build_layout()
         self.apply_style()
         self.update_sizing_controls()
+        self.update_description_controls()
+        # Automatically refresh model/style metadata on startup when an API key is available
+        try:
+            if self.api_key_edit.text().strip():
+                self.refresh_metadata()
+        except Exception:
+            # Do not let metadata refresh failures prevent the UI from starting
+            pass
+
+    def build_menu(self):
+        """Create prompt file actions."""
+        prompt_menu = self.menuBar().addMenu("Prompt")
+
+        save_action = QAction("Save Prompt...", self)
+        save_action.triggered.connect(self.save_prompt)
+        prompt_menu.addAction(save_action)
+
+        load_action = QAction("Load Prompt...", self)
+        load_action.triggered.connect(self.load_prompt)
+        prompt_menu.addAction(load_action)
 
     def build_layout(self):
         """Assemble the form and preview area."""
@@ -402,27 +481,62 @@ class ImageGenerationWindow(QMainWindow):
         output_row.addWidget(self.output_dir_edit, 1)
         output_row.addWidget(self.output_dir_button)
 
-        settings_form = QFormLayout()
-        settings_form.addRow("API key", self.api_key_edit)
-        settings_form.addRow("Model", self.wrap_layout(model_row))
-        settings_form.addRow("Prompt", self.prompt_edit)
-        settings_form.addRow("Negative prompt", self.negative_prompt_edit)
-        settings_form.addRow("Style", self.style_combo)
-        settings_form.addRow("Sizing", self.sizing_mode_combo)
-        settings_form.addRow("Width", self.width_spin)
-        settings_form.addRow("Height", self.height_spin)
-        settings_form.addRow("Aspect ratio", self.aspect_ratio_combo)
-        settings_form.addRow("Resolution", self.resolution_combo)
-        settings_form.addRow("Format", self.format_combo)
-        settings_form.addRow("Quality", self.quality_combo)
-        settings_form.addRow("Variants", self.variants_spin)
-        settings_form.addRow("Steps", self.steps_spin)
-        settings_form.addRow("CFG scale", self.cfg_spin)
-        settings_form.addRow("Seed", self.seed_spin)
-        settings_form.addRow("Output directory", self.wrap_layout(output_row))
-        settings_form.addRow("Filename prefix", self.filename_prefix_edit)
+        api_form = QFormLayout()
+        api_form.addRow("API key", self.api_key_edit)
+        api_form.addRow("Model", self.wrap_layout(model_row))
+
+        api_group = QGroupBox("Connection")
+        api_group.setLayout(api_form)
+
+        prompt_form = QFormLayout()
+        prompt_form.addRow("Prompt", self.prompt_edit)
+        prompt_form.addRow("Negative", self.negative_prompt_edit)
+        prompt_form.addRow("Description", self.description_edit)
+
+        prompt_group = QGroupBox("Prompt")
+        prompt_group.setLayout(prompt_form)
+
+        params_grid = QGridLayout()
+        params_grid.addWidget(QLabel("Style"), 0, 0)
+        params_grid.addWidget(self.style_combo, 0, 1)
+        params_grid.addWidget(QLabel("Sizing"), 0, 2)
+        params_grid.addWidget(self.sizing_mode_combo, 0, 3)
+        params_grid.addWidget(QLabel("Width"), 0, 4)
+        params_grid.addWidget(self.width_spin, 0, 5)
+        params_grid.addWidget(QLabel("Height"), 1, 0)
+        params_grid.addWidget(self.height_spin, 1, 1)
+        params_grid.addWidget(QLabel("Aspect"), 1, 2)
+        params_grid.addWidget(self.aspect_ratio_combo, 1, 3)
+        params_grid.addWidget(QLabel("Resolution"), 1, 4)
+        params_grid.addWidget(self.resolution_combo, 1, 5)
+        params_grid.addWidget(QLabel("Format"), 2, 0)
+        params_grid.addWidget(self.format_combo, 2, 1)
+        params_grid.addWidget(QLabel("Quality"), 2, 2)
+        params_grid.addWidget(self.quality_combo, 2, 3)
+        params_grid.addWidget(QLabel("Variants"), 2, 4)
+        params_grid.addWidget(self.variants_spin, 2, 5)
+        params_grid.addWidget(QLabel("Steps"), 3, 0)
+        params_grid.addWidget(self.steps_spin, 3, 1)
+        params_grid.addWidget(QLabel("CFG"), 3, 2)
+        params_grid.addWidget(self.cfg_spin, 3, 3)
+        params_grid.addWidget(QLabel("Seed"), 3, 4)
+        params_grid.addWidget(self.seed_spin, 3, 5)
+        params_grid.setColumnStretch(1, 1)
+        params_grid.setColumnStretch(3, 1)
+        params_grid.setColumnStretch(5, 1)
+
+        params_group = QGroupBox("Image Parameters")
+        params_group.setLayout(params_grid)
+
+        output_form = QFormLayout()
+        output_form.addRow("Directory", self.wrap_layout(output_row))
+        output_form.addRow("Filename prefix", self.filename_prefix_edit)
+
+        output_group = QGroupBox("Output")
+        output_group.setLayout(output_form)
 
         toggles = QHBoxLayout()
+        toggles.addWidget(self.description_check)
         toggles.addWidget(self.safe_mode_check)
         toggles.addWidget(self.hide_watermark_check)
         toggles.addWidget(self.enhance_prompt_check)
@@ -434,8 +548,14 @@ class ImageGenerationWindow(QMainWindow):
         controls.addWidget(self.open_output_button)
         controls.addStretch(1)
 
+        top_controls = QHBoxLayout()
+        top_controls.addWidget(api_group, 1)
+        top_controls.addWidget(output_group, 1)
+
         left_layout = QVBoxLayout()
-        left_layout.addLayout(settings_form)
+        left_layout.addLayout(top_controls)
+        left_layout.addWidget(params_group)
+        left_layout.addWidget(prompt_group, 1)
         left_layout.addLayout(toggles)
         left_layout.addWidget(self.progress)
         left_layout.addWidget(self.status_label)
@@ -444,6 +564,11 @@ class ImageGenerationWindow(QMainWindow):
         left = QWidget()
         left.setLayout(left_layout)
 
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QScrollArea.NoFrame)
+        left_scroll.setWidget(left)
+
         right_layout = QVBoxLayout()
         right_layout.addWidget(self.preview_label, 1)
         right_layout.addWidget(QLabel("Generated files"))
@@ -451,12 +576,14 @@ class ImageGenerationWindow(QMainWindow):
 
         right = QWidget()
         right.setLayout(right_layout)
+        right.setMaximumWidth(560)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left)
+        splitter.addWidget(left_scroll)
         splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 1)
+        splitter.setSizes((980, 360))
 
         layout = QVBoxLayout()
         layout.addWidget(splitter)
@@ -501,6 +628,26 @@ class ImageGenerationWindow(QMainWindow):
                 color: #d6d9df;
             }
 
+            QTextEdit:disabled {
+                background: #292b2f;
+                color: #8b9098;
+            }
+
+            QMenuBar {
+                background: #202124;
+                color: #f1f3f4;
+            }
+
+            QMenuBar::item:selected,
+            QMenu {
+                background: #2f3136;
+                color: #f1f3f4;
+            }
+
+            QMenu::item:selected {
+                background: #2f80ed;
+            }
+
             QPushButton {
                 background: #3c4043;
                 border: 1px solid #5f6368;
@@ -523,6 +670,20 @@ class ImageGenerationWindow(QMainWindow):
                 color: #c9d1d9;
             }
 
+            QGroupBox {
+                border: 1px solid #4b4f58;
+                border-radius: 4px;
+                color: #f1f3f4;
+                margin-top: 12px;
+                padding: 10px 8px 8px 8px;
+            }
+
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 8px;
+                padding: 0 4px;
+            }
+
             QProgressBar {
                 background: #2f3136;
                 border: 1px solid #4b4f58;
@@ -540,6 +701,10 @@ class ImageGenerationWindow(QMainWindow):
             QSplitter::handle {
                 background: #3c4043;
                 width: 4px;
+            }
+
+            QScrollArea {
+                border: none;
             }
             """
         )
@@ -615,6 +780,67 @@ class ImageGenerationWindow(QMainWindow):
         self.output_dir_edit.setText(dirname)
         self.settings.setValue(OUTPUT_DIR_SETTING, dirname)
 
+    def save_prompt(self):
+        """Save prompt fields to a JSON file."""
+        prompt_dir = self.settings.value(PROMPT_DIR_SETTING, str(Path.cwd()), str)
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save prompt",
+            str(Path(prompt_dir) / "image-prompt.json"),
+            "Prompt JSON (*.json);;Text files (*.txt);;All files (*)",
+        )
+        if not filename:
+            return
+
+        try:
+            path = Path(filename)
+            self.settings.setValue(PROMPT_DIR_SETTING, str(path.parent))
+            if path.suffix.lower() == ".txt":
+                path.write_text(self.prompt_edit.toPlainText(), encoding="utf-8")
+            else:
+                data = {
+                    "prompt": self.prompt_edit.toPlainText(),
+                    "negative_prompt": self.negative_prompt_edit.toPlainText(),
+                    "use_description": self.description_check.isChecked(),
+                    "description": self.description_edit.toPlainText(),
+                }
+                path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+            self.status_label.setText(f"Saved prompt: {path}")
+        except OSError as exc:
+            QMessageBox.critical(self, "Save prompt failed", str(exc))
+
+    def load_prompt(self):
+        """Load prompt fields from a JSON or plain text file."""
+        prompt_dir = self.settings.value(PROMPT_DIR_SETTING, str(Path.cwd()), str)
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load prompt",
+            prompt_dir,
+            "Prompt files (*.json *.txt);;All files (*)",
+        )
+        if not filename:
+            return
+
+        try:
+            path = Path(filename)
+            self.settings.setValue(PROMPT_DIR_SETTING, str(path.parent))
+            text = path.read_text(encoding="utf-8")
+            if path.suffix.lower() == ".json":
+                data = json.loads(text)
+                if not isinstance(data, dict):
+                    raise ValueError("Prompt JSON must contain an object.")
+                self.prompt_edit.setPlainText(str(data.get("prompt", "")))
+                self.negative_prompt_edit.setPlainText(str(data.get("negative_prompt", "")))
+                self.description_check.setChecked(bool(data.get("use_description", False)))
+                self.description_edit.setPlainText(str(data.get("description", "")))
+            else:
+                self.prompt_edit.setPlainText(text)
+
+            self.status_label.setText(f"Loaded prompt: {path}")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            QMessageBox.critical(self, "Load prompt failed", str(exc))
+
     def update_sizing_controls(self):
         """Enable only the controls used by the selected sizing mode."""
         mode = self.sizing_mode_combo.currentData()
@@ -622,6 +848,10 @@ class ImageGenerationWindow(QMainWindow):
         self.height_spin.setEnabled(mode == SIZING_WIDTH_HEIGHT)
         self.aspect_ratio_combo.setEnabled(mode in {SIZING_ASPECT_RATIO, SIZING_RESOLUTION_ASPECT})
         self.resolution_combo.setEnabled(mode == SIZING_RESOLUTION_ASPECT)
+
+    def update_description_controls(self):
+        """Enable description text only when PNG metadata is requested."""
+        self.description_edit.setEnabled(self.description_check.isChecked())
 
     def selected_model(self):
         """Return the selected or typed model ID."""
@@ -685,6 +915,9 @@ class ImageGenerationWindow(QMainWindow):
         output_dir = self.output_dir_edit.text().strip()
         prefix = self.filename_prefix_edit.text().strip() or "venice-image"
         payload = self.generation_payload()
+        description = ""
+        if self.description_check.isChecked():
+            description = self.description_edit.toPlainText().strip()
 
         if not api_key:
             QMessageBox.warning(self, "Missing API key", "Enter your Venice AI API key first.")
@@ -710,6 +943,7 @@ class ImageGenerationWindow(QMainWindow):
             output_dir,
             prefix,
             payload["format"],
+            description,
         )
         self.generation_worker.moveToThread(self.generation_thread)
         self.generation_thread.started.connect(self.generation_worker.run)
@@ -724,18 +958,22 @@ class ImageGenerationWindow(QMainWindow):
 
     def generation_finished(self, paths, enhanced_prompt):
         """Handle successful image generation."""
-        self.generated_paths = list(paths)
-        self.output_list.clear()
-        self.output_list.addItems(self.generated_paths)
-        if self.generated_paths:
-            self.output_list.setCurrentRow(0)
+        new_paths = list(paths)
+        self.generated_paths.extend(new_paths)
+
+        self.output_list.blockSignals(True)
+        self.output_list.addItems(new_paths)
+        self.output_list.blockSignals(False)
+
+        if new_paths:
+            self.display_image(new_paths[0])
 
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
-        self.open_output_button.setEnabled(bool(self.generated_paths))
+        self.open_output_button.setEnabled(bool(self.output_list.currentItem()))
         self.set_generating(False)
 
-        message = f"Saved {len(self.generated_paths)} image file(s)."
+        message = f"Saved {len(new_paths)} image file(s)."
         if enhanced_prompt:
             message += " Enhanced prompt returned in the response headers."
         self.status_label.setText(message)
@@ -754,19 +992,22 @@ class ImageGenerationWindow(QMainWindow):
         self.generation_worker = None
 
     def preview_selected_image(self, _row=None):
-        """Load the selected generated image into the preview."""
+        """Preview the selected generated image."""
         item = self.output_list.currentItem()
         if not item:
             self.preview_label.setText("Generated image preview")
             self.open_output_button.setEnabled(False)
             return
 
-        image_path = item.text()
+        self.display_image(item.text())
+
+    def display_image(self, image_path):
+        """Load an image path into the preview."""
         pixmap = QPixmap(image_path)
         if pixmap.isNull():
             self.preview_label.setText(f"Could not preview:\n{image_path}")
             self.open_output_button.setEnabled(False)
-            return
+            return False
 
         scaled = pixmap.scaled(
             self.preview_label.size(),
@@ -775,6 +1016,7 @@ class ImageGenerationWindow(QMainWindow):
         )
         self.preview_label.setPixmap(scaled)
         self.open_output_button.setEnabled(True)
+        return True
 
     def open_selected_image(self):
         """Open the selected generated image with the desktop handler."""
@@ -803,6 +1045,14 @@ class ImageGenerationWindow(QMainWindow):
             )
             event.ignore()
             return
+        if self.metadata_thread:
+            QMessageBox.warning(
+                self,
+                "Metadata refresh in progress",
+                "Wait for image model refresh to finish before closing.",
+            )
+            event.ignore()
+            return
         super().closeEvent(event)
 
 
@@ -810,7 +1060,7 @@ def main():
     """Run the Venice AI image-generation GUI."""
     app = QApplication(sys.argv)
     window = ImageGenerationWindow()
-    window.show()
+    window.showMaximized()
     return app.exec()
 
 

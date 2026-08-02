@@ -2,6 +2,7 @@
 """PySide6 front end for writing stories with Venice AI chat models."""
 
 import html
+import json
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -34,6 +35,7 @@ from modules.tts import get_venice_api_key
 
 
 API_URL = "https://api.venice.ai/api/v1/chat/completions"
+MODELS_URL = "https://api.venice.ai/api/v1/models"
 DEFAULT_MODEL = "venice-uncensored-1-2"
 SYSTEM_PROMPT = (
     "You are a creative writing assistant. Help write engaging stories with "
@@ -49,14 +51,104 @@ MARKDOWN_EXTENSIONS = (
 )
 MODELS = (
     "venice-uncensored-1-2",
-    "venice-uncensored",
-    "zai-org-glm-5-2",
-    "zai-org-glm-4.7",
+    "venice-uncensored-role-play",
+    "e2ee-venice-uncensored-24b-p",
+    "qwen-3-6-plus",
+    "e2ee-qwen3-6-35b-a3b-uncensored-p",
+    "gemma-4-uncensored",
+    "e2ee-gemma-4-26b-a4b-uncensored-p",
     "olafangensan-glm-4.7-flash-heretic",
-    "llama-3.3-70b",
-    "qwen-2.5-72b",
-    "dolphin-2.9.4-qwen2-72b",
 )
+
+
+@dataclass
+class ChatModelOption:
+    """One selectable Venice chat model."""
+
+    model_id: str
+    label: str
+    context_length: int = 0
+
+
+def model_text(model):
+    """Return searchable model metadata text."""
+    return json.dumps(model, ensure_ascii=False, sort_keys=True).lower()
+
+
+def model_identifier(model):
+    """Return the Venice model ID from a model metadata object."""
+    if not isinstance(model, dict):
+        return ""
+    value = model.get("id") or model.get("model")
+    return str(value).strip() if value else ""
+
+
+def model_display_name(model):
+    """Return the human-readable model name when available."""
+    if not isinstance(model, dict):
+        return ""
+
+    model_spec = model.get("model_spec")
+    if isinstance(model_spec, dict):
+        value = model_spec.get("name")
+        if value:
+            return str(value).strip()
+
+    value = model.get("name")
+    return str(value).strip() if value else ""
+
+
+def normalize_model_list(data):
+    """Return a list from Venice's model-list response shapes."""
+    models = data.get("data", data) if isinstance(data, dict) else data
+    if isinstance(models, dict):
+        return list(models.values())
+    if isinstance(models, list):
+        return models
+    return []
+
+
+def model_context_length(model):
+    """Return context length when available."""
+    if not isinstance(model, dict):
+        return 0
+    model_spec = model.get("model_spec")
+    spec_context = 0
+    if isinstance(model_spec, dict):
+        spec_context = int(model_spec.get("availableContextTokens") or 0)
+    return int(model.get("context_length") or spec_context or 0)
+
+
+def is_uncensored_chat_model(model):
+    """Return True when model metadata advertises uncensored text chat behavior."""
+    if not isinstance(model, dict):
+        return False
+    if str(model.get("type", "")).lower() != "text":
+        return False
+    text = model_text(model)
+    return "uncensored" in text or "unrestricted" in text
+
+
+def chat_model_option(model):
+    """Build a combo-box option from model metadata."""
+    model_id = model_identifier(model)
+    name = model_display_name(model)
+    context_length = model_context_length(model)
+    label = model_id if not name or name == model_id else f"{name} ({model_id})"
+    if context_length:
+        label = f"{label} - {context_length:,} ctx"
+    return ChatModelOption(model_id, label, context_length)
+
+
+def extract_uncensored_chat_models(data):
+    """Extract uncensored chat model options from Venice model metadata."""
+    options = [
+        chat_model_option(model)
+        for model in normalize_model_list(data)
+        if is_uncensored_chat_model(model) and model_identifier(model)
+    ]
+    options.sort(key=lambda option: (option.model_id != DEFAULT_MODEL, option.label.lower()))
+    return options
 
 
 @dataclass
@@ -118,6 +210,37 @@ class VeniceChatWorker(QObject):
         return messages
 
 
+class VeniceChatModelsWorker(QObject):
+    """Load uncensored Venice chat models without blocking the Qt event loop."""
+
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, api_key):
+        super().__init__()
+        self.api_key = api_key
+
+    def run(self):
+        """Fetch current text models and return uncensored options."""
+        try:
+            response = requests.get(
+                MODELS_URL,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Accept": "application/json",
+                },
+                params={"type": "text"},
+                timeout=60,
+            )
+            response.raise_for_status()
+            options = extract_uncensored_chat_models(response.json())
+            if not options:
+                raise RuntimeError("No uncensored chat completion models were returned by the models API.")
+            self.finished.emit(options)
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 class PromptEdit(QTextEdit):
     """Text edit that submits with Ctrl+Enter."""
 
@@ -137,6 +260,8 @@ class StoryWriterWindow(QMainWindow):
         super().__init__()
         self.thread = None
         self.worker = None
+        self.models_thread = None
+        self.models_worker = None
         self.pending_prompt = ""
         self.current_entry = None
         self.conversation_history = []
@@ -149,8 +274,12 @@ class StoryWriterWindow(QMainWindow):
         self.api_key_edit.setPlaceholderText("VENICE_API_KEY")
 
         self.model_combo = QComboBox()
-        self.model_combo.addItems(MODELS)
+        for model_id in MODELS:
+            self.model_combo.addItem(model_id, model_id)
         self.model_combo.setCurrentText(DEFAULT_MODEL)
+
+        self.refresh_models_button = QPushButton("Refresh Models")
+        self.refresh_models_button.clicked.connect(self.refresh_models)
 
         self.max_tokens_spin = QSpinBox()
         self.max_tokens_spin.setRange(1024, 32768)
@@ -194,11 +323,14 @@ class StoryWriterWindow(QMainWindow):
         shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
         shortcut.activated.connect(self.send_prompt)
 
+        if self.api_key_edit.text().strip():
+            self.refresh_models()
+
     def build_layout(self):
         """Assemble the form, editor, and command controls."""
         settings_form = QFormLayout()
         settings_form.addRow("API key", self.api_key_edit)
-        settings_form.addRow("Model", self.model_combo)
+        settings_form.addRow("Model", self.row(self.model_combo, self.refresh_models_button))
         settings_form.addRow("Max tokens", self.max_tokens_spin)
 
         settings_panel = QWidget()
@@ -244,6 +376,17 @@ class StoryWriterWindow(QMainWindow):
         central = QWidget()
         central.setLayout(layout)
         self.setCentralWidget(central)
+
+    @staticmethod
+    def row(*widgets):
+        """Return a horizontal row widget for form controls."""
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        for widget in widgets:
+            layout.addWidget(widget)
+        container = QWidget()
+        container.setLayout(layout)
+        return container
 
     def apply_style(self):
         """Apply a compact dark Qt stylesheet."""
@@ -291,6 +434,66 @@ class StoryWriterWindow(QMainWindow):
             """
         )
 
+    def selected_model(self):
+        """Return the selected Venice model ID."""
+        data = self.model_combo.currentData()
+        if data:
+            return str(data).strip()
+        return self.model_combo.currentText().strip()
+
+    def refresh_models(self):
+        """Refresh uncensored chat models from Venice."""
+        if self.models_thread:
+            return
+
+        api_key = self.api_key_edit.text().strip()
+        if not api_key:
+            QMessageBox.warning(self, "Missing API key", "Enter your Venice AI API key first.")
+            return
+
+        self.status_label.setText("Loading uncensored chat models...")
+        self.refresh_models_button.setEnabled(False)
+
+        self.models_thread = QThread(self)
+        self.models_worker = VeniceChatModelsWorker(api_key)
+        self.models_worker.moveToThread(self.models_thread)
+        self.models_thread.started.connect(self.models_worker.run)
+        self.models_worker.finished.connect(self.models_loaded)
+        self.models_worker.failed.connect(self.models_failed)
+        self.models_worker.finished.connect(self.models_thread.quit)
+        self.models_worker.failed.connect(self.models_thread.quit)
+        self.models_thread.finished.connect(self.models_worker.deleteLater)
+        self.models_thread.finished.connect(self.models_thread.deleteLater)
+        self.models_thread.finished.connect(self.clear_models_worker)
+        self.models_thread.start()
+
+    def models_loaded(self, options):
+        """Populate the model selector with uncensored chat models."""
+        current_model = self.selected_model()
+        self.model_combo.clear()
+        for option in options:
+            self.model_combo.addItem(option.label, option.model_id)
+
+        index = self.model_combo.findData(current_model)
+        if index < 0:
+            index = self.model_combo.findData(DEFAULT_MODEL)
+        if index >= 0:
+            self.model_combo.setCurrentIndex(index)
+
+        self.refresh_models_button.setEnabled(True)
+        self.status_label.setText(f"Loaded {len(options)} uncensored chat models.")
+
+    def models_failed(self, message):
+        """Display model refresh errors without clearing fallback models."""
+        self.refresh_models_button.setEnabled(True)
+        self.status_label.setText("Model refresh failed.")
+        QMessageBox.critical(self, "Model refresh failed", message)
+
+    def clear_models_worker(self):
+        """Clear finished model worker references."""
+        self.models_thread = None
+        self.models_worker = None
+
     def send_prompt(self):
         """Validate input and start a background Venice request."""
         prompt = self.prompt_input.toPlainText().strip()
@@ -313,7 +516,7 @@ class StoryWriterWindow(QMainWindow):
         self.thread = QThread(self)
         self.worker = VeniceChatWorker(
             api_key,
-            self.model_combo.currentText(),
+            self.selected_model(),
             prompt,
             list(self.conversation_history),
             self.max_tokens_spin.value(),
@@ -705,7 +908,7 @@ class StoryWriterWindow(QMainWindow):
             "# Story Writing Session",
             "",
             f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            f"**Model:** {self.model_combo.currentText()}",
+            f"**Model:** {self.selected_model()}",
             "",
             "---",
             "",
@@ -762,8 +965,29 @@ class StoryWriterWindow(QMainWindow):
         self.save_html_button.setEnabled(not generating)
         self.api_key_edit.setEnabled(not generating)
         self.model_combo.setEnabled(not generating)
+        self.refresh_models_button.setEnabled(not generating and self.models_thread is None)
         self.max_tokens_spin.setEnabled(not generating)
         self.prompt_input.setEnabled(not generating)
+
+    def closeEvent(self, event):
+        """Prevent closing while background work is active."""
+        if self.thread:
+            QMessageBox.warning(
+                self,
+                "Generation in progress",
+                "Wait for the current response to finish before closing.",
+            )
+            event.ignore()
+            return
+        if self.models_thread:
+            QMessageBox.warning(
+                self,
+                "Model refresh in progress",
+                "Wait for model refresh to finish before closing.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 
 def main():
