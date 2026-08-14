@@ -98,7 +98,7 @@ Run the text-to-speech GUI:
 python venice-ai-tts.py
 ```
 
-Choose a `.txt`, `.html`, or `.htm` file, select an output directory and voice, then convert it to an MP3. HTML files are extracted to editable text before conversion.
+Choose one or more `.txt`, `.html`, or `.htm` files, select an output directory and voice, then add them to the queue. Files are converted to MP3s in order in the background, and the queue list shows running, completed, and failed items. HTML files are extracted to text automatically before conversion.
 
 Run the model listing helper:
 

@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,6 +79,14 @@ MAX_SEGMENT_SECONDS = 15
 VIDEO_RESOLUTION = "1080p"
 VIDEO_ASPECT_RATIO = "16:9"
 
+SEEDANCE_ENHANCED_R2V_MODEL = (
+    "seedance-2-0-enhanced-reference-to-video"
+)
+
+PREFERRED_VIDEO_MODEL_IDS = {
+    SEEDANCE_ENHANCED_R2V_MODEL,
+}
+
 HTTP_TIMEOUT = (30, 180)
 DOWNLOAD_TIMEOUT = (30, 600)
 
@@ -130,6 +139,9 @@ class Segment:
     duration_seconds: int
     description: str
     transition_note: str = ""
+    first_frame_continuity: str = ""
+    motion_continuation: str = ""
+    final_frame: str = ""
 
     @property
     def duration(self):
@@ -144,9 +156,11 @@ class VideoModelOption:
     model_id: str
     label: str
     uncensored: bool = False
+    preferred: bool = False
     durations: tuple = ()
     resolutions: tuple = ()
     aspect_ratios: tuple = ()
+    max_reference_images: int = 0
 
 
 class VeniceAPIError(RuntimeError):
@@ -249,6 +263,10 @@ def is_image_to_video_model(model):
         "image_to_video",
         "image2video",
         "i2v",
+        "reference-to-video",
+        "reference to video",
+        "reference_to_video",
+        "r2v",
     }
 
     return any(marker in text for marker in image_to_video_markers)
@@ -261,6 +279,26 @@ def is_uncensored_model(model):
         "uncensored" in text
         or "unrestricted" in text
     )
+
+
+def is_preferred_video_model_id(model_id):
+    """Return True for models kept visible despite metadata labels."""
+    return model_id.lower() in PREFERRED_VIDEO_MODEL_IDS
+
+
+def is_preferred_video_model(model):
+    """Return True for a locally preferred model."""
+    return is_preferred_video_model_id(
+        model_identifier(model).lower()
+    )
+
+
+def reference_image_tag(model_id, index):
+    """Return the prompt tag for one flat reference image."""
+    if "seedance" in model_id.lower():
+        return f"<Image {index}>"
+
+    return f"@Image{index}"
 
 
 def model_constraints(model):
@@ -290,11 +328,36 @@ def tuple_constraint(constraints, name):
     return tuple(str(item) for item in value if item)
 
 
+def reference_image_limit(model):
+    """Return supported flat reference-image count for one model."""
+    model_id = model_identifier(model).lower()
+    text = model_text(model)
+
+    if (
+        "reference-to-video" not in model_id
+        and "r2v" not in text
+    ):
+        return 0
+
+    if "seedance" in model_id:
+        return 9
+
+    if "grok" in model_id:
+        return 7
+
+    # Venice reference-to-video docs cap combined visual inputs at 7 for
+    # Kling-style models; use that as a conservative flat-reference limit.
+    return 7
+
+
 def model_option(model):
     """Build a GUI option from model metadata."""
     model_id = model_identifier(model)
     name = model_display_name(model)
     uncensored = is_uncensored_model(model)
+    preferred = is_preferred_video_model_id(
+        model_id.lower()
+    )
     constraints = model_constraints(model)
 
     if name and name != model_id:
@@ -304,15 +367,60 @@ def model_option(model):
 
     if uncensored:
         label = f"{label} - uncensored"
+    elif preferred:
+        label = f"{label} - preferred/permissive"
 
     return VideoModelOption(
         model_id=model_id,
         label=label,
         uncensored=uncensored,
+        preferred=preferred,
         durations=tuple_constraint(constraints, "durations"),
         resolutions=tuple_constraint(constraints, "resolutions"),
         aspect_ratios=tuple_constraint(constraints, "aspect_ratios"),
+        max_reference_images=reference_image_limit(model),
     )
+
+
+def known_video_model_options(generation_mode):
+    """Return local fallback model options not always advertised as uncensored."""
+    if generation_mode != IMAGE_TO_VIDEO_MODE:
+        return []
+
+    return [
+        VideoModelOption(
+            model_id=SEEDANCE_ENHANCED_R2V_MODEL,
+            label=(
+                "Seedance 2.0 R2V Enhanced "
+                f"({SEEDANCE_ENHANCED_R2V_MODEL}) - preferred/permissive"
+            ),
+            uncensored=False,
+            preferred=True,
+            durations=(
+                "10s",
+                "9s",
+                "8s",
+                "7s",
+                "6s",
+                "5s",
+                "4s",
+                "3s",
+                "2s",
+                "1s",
+            ),
+            resolutions=("1080p", "720p"),
+            aspect_ratios=(
+                "16:9",
+                "4:3",
+                "3:2",
+                "1:1",
+                "2:3",
+                "3:4",
+                "9:16",
+            ),
+            max_reference_images=9,
+        ),
+    ]
 
 
 def extract_video_models(data, generation_mode):
@@ -330,23 +438,31 @@ def extract_video_models(data, generation_mode):
         if predicate(model) and model_identifier(model)
     ]
 
+    existing_model_ids = {
+        option.model_id
+        for option in options
+    }
+    for known_option in known_video_model_options(generation_mode):
+        if known_option.model_id not in existing_model_ids:
+            options.append(known_option)
+
     options.sort(
         key=lambda option: (
-            not option.uncensored,
+            not (option.uncensored or option.preferred),
             option.label.lower(),
         )
     )
 
-    uncensored_options = [
+    preferred_options = [
         option
         for option in options
-        if option.uncensored
+        if option.uncensored or option.preferred
     ]
 
-    if uncensored_options:
+    if preferred_options:
         return (
-            uncensored_options,
-            f"Loaded uncensored {mode_label} models.",
+            preferred_options,
+            f"Loaded uncensored/preferred {mode_label} models.",
         )
 
     return (
@@ -428,6 +544,7 @@ class VeniceVideoWorker(QObject):
 
     progress = Signal(int, str)
     segment_ready = Signal(str)
+    seedance_consent_required = Signal(int, str, str, str)
     finished = Signal(str)
     failed = Signal(str)
 
@@ -443,6 +560,7 @@ class VeniceVideoWorker(QObject):
         segment_durations,
         video_resolution,
         video_aspect_ratio,
+        reference_files,
         retain_intermediate_files,
     ):
         super().__init__()
@@ -457,10 +575,16 @@ class VeniceVideoWorker(QObject):
         self.segment_durations = list(segment_durations)
         self.video_resolution = video_resolution
         self.video_aspect_ratio = video_aspect_ratio
+        self.reference_files = [
+            Path(path)
+            for path in reference_files
+        ]
         self.retain_intermediate_files = retain_intermediate_files
         self.destination_dir = self.output_file.parent
         self.output_stem = self.output_file.stem
         self.intermediate_files = []
+        self.seedance_consent_event = threading.Event()
+        self.seedance_consent_accepted = False
 
         self.session = requests.Session()
         self.session.headers.update(
@@ -500,6 +624,10 @@ class VeniceVideoWorker(QObject):
             self.save_segments_json(segments)
 
             current_image_path = self.source_file
+            reference_data_urls = [
+                self.image_to_data_url(path)
+                for path in self.reference_files
+            ]
             segment_files = []
             segment_count = len(segments)
 
@@ -533,6 +661,7 @@ class VeniceVideoWorker(QObject):
                     segment=segment,
                     output_path=output_path,
                     source_data_url=source_data_url,
+                    reference_data_urls=reference_data_urls,
                 )
 
                 self.validate_media_file(
@@ -845,15 +974,21 @@ class VeniceVideoWorker(QObject):
         description = {}
 
         for key, value in payload.items():
-            if key == "image_url":
-                text = str(value or "")
-                if text.startswith("data:"):
-                    header = text.split(",", 1)[0]
-                    description[key] = (
-                        f"{header},... ({len(text):,} chars)"
-                    )
-                else:
-                    description[key] = text
+            if key in {
+                "image_url",
+                "reference_image_urls",
+                "referenceImageUrls",
+            }:
+                if isinstance(value, list):
+                    description[key] = [
+                        VeniceVideoWorker.describe_image_value(item)
+                        for item in value
+                    ]
+                    continue
+
+                description[key] = VeniceVideoWorker.describe_image_value(
+                    value
+                )
             elif key == "prompt":
                 text = str(value or "")
                 description["prompt_chars"] = len(text)
@@ -866,6 +1001,111 @@ class VeniceVideoWorker(QObject):
             ensure_ascii=False,
             sort_keys=True,
         )
+
+    @staticmethod
+    def describe_image_value(value):
+        """Return a log-safe description of an image URL or data URL."""
+        text = str(value or "")
+        if text.startswith("data:"):
+            header = text.split(",", 1)[0]
+            return f"{header},... ({len(text):,} chars)"
+
+        return text
+
+    @staticmethod
+    def parse_json_diagnostic(text):
+        """Parse a diagnostic JSON string if Venice returned one."""
+        try:
+            value = json.loads(text or "")
+        except ValueError:
+            return {}
+
+        return value if isinstance(value, dict) else {}
+
+    @classmethod
+    def seedance_consent_info(cls, error):
+        """Return consent info from a Venice needs_consent response."""
+        if error.status_code != 409:
+            return None
+
+        data = cls.parse_json_diagnostic(error.body)
+        error_data = data.get("error")
+        if not isinstance(error_data, dict):
+            error_data = {}
+
+        code = str(
+            error_data.get("code")
+            or data.get("code")
+            or data.get("error")
+            or ""
+        )
+        consent_flow = str(
+            data.get("consent_flow")
+            or data.get("consentFlow")
+            or ""
+        )
+
+        if (
+            code != "needs_consent"
+            and consent_flow != "seedance"
+        ):
+            return None
+
+        consent = data.get("consent")
+        if not isinstance(consent, dict):
+            consent = {}
+
+        roles = data.get("face_media_roles")
+        if isinstance(roles, list):
+            roles_text = ", ".join(
+                str(role)
+                for role in roles
+            )
+        else:
+            roles_text = ""
+
+        policy_text = str(
+            consent.get("policy_text")
+            or error_data.get("message")
+            or "Seedance consent is required for this request."
+        )
+        docs_url = str(
+            data.get("docs_url")
+            or "https://docs.venice.ai/guides/media/seedance-face-consent"
+        )
+
+        return {
+            "policy_text": policy_text,
+            "roles_text": roles_text,
+            "docs_url": docs_url,
+        }
+
+    @staticmethod
+    def seedance_consent_payload():
+        """Return Venice's required Seedance consent attestation."""
+        return {
+            "confirmed_terms_and_privacy": True,
+            "confirmed_legal_right": True,
+            "confirmed_screening_acknowledged": True,
+        }
+
+    def set_seedance_consent_response(self, accepted):
+        """Receive the GUI consent decision."""
+        self.seedance_consent_accepted = bool(accepted)
+        self.seedance_consent_event.set()
+
+    def request_seedance_consent(self, segment_number, info):
+        """Ask the GUI thread for a Seedance consent decision."""
+        self.seedance_consent_accepted = False
+        self.seedance_consent_event.clear()
+        self.seedance_consent_required.emit(
+            segment_number,
+            info["policy_text"],
+            info["roles_text"],
+            info["docs_url"],
+        )
+        self.seedance_consent_event.wait()
+        return self.seedance_consent_accepted
 
     @staticmethod
     def find_first_value(data, names):
@@ -1018,6 +1258,11 @@ class VeniceVideoWorker(QObject):
             self.segment_durations,
             start=1,
         ):
+            continuity = (
+                "Match the supplied starting reference image."
+                if index == 1
+                else "Match the exact final frame of the previous segment."
+            )
             final_note = (
                 "Description of the final shot."
                 if index == segment_count
@@ -1032,6 +1277,18 @@ class VeniceVideoWorker(QObject):
                             '    "description": '
                             f'"Complete prompt for this {duration}-second segment.",'
                         ),
+                        (
+                            '    "first_frame_continuity": '
+                            f'"{continuity}",'
+                        ),
+                        (
+                            '    "motion_continuation": '
+                            '"How the action continues from the first frame.",'
+                        ),
+                        (
+                            '    "final_frame": '
+                            f'"{final_note}",'
+                        ),
                         f'    "transition_note": "{final_note}"',
                         "  }",
                     ]
@@ -1043,10 +1300,11 @@ class VeniceVideoWorker(QObject):
             mode_context = """
 The first segment starts from a reference image supplied separately.
 Each later segment starts from the extracted final frame of the preceding
-segment.
+segment. The supplied image for each segment must be treated as the exact
+first frame, not as loose inspiration.
 """.strip()
             mode_requirement = (
-                "Each description must work as an independent "
+                "Each description must work as a continuation-focused "
                 "image-to-video prompt."
             )
         else:
@@ -1080,10 +1338,17 @@ Requirements:
    lens, and visual-style details when needed for consistency.
 8. Describe subject movement, environmental movement, camera movement,
    composition, lighting, pacing, and the desired ending frame.
-9. Do not request captions, subtitles, logos, watermarks, or visible text.
-10. Segment 4 must end with a satisfying final shot.
-11. {mode_requirement}
-12. Do not mention API parameters, duration fields, or source-image URLs
+9. For every segment after 1, the first visible moment must match the prior
+   segment's final frame: same character identity, clothing, pose,
+   expression, body position, object positions, camera angle, lens,
+   composition, lighting, color grade, and environment.
+10. Avoid phrases that imply a new establishing shot, a scene reset,
+    a recap, or a time jump unless the original concept explicitly asks
+    for one.
+11. Do not request captions, subtitles, logos, watermarks, or visible text.
+12. The final segment must end with a satisfying final shot.
+13. {mode_requirement}
+14. Do not mention API parameters, duration fields, or source-image URLs
     inside the descriptions.
 
 Return only a JSON array in exactly this form:
@@ -1164,6 +1429,18 @@ Original video concept:
                 item.get("transition_note", "")
             ).strip()
 
+            first_frame_continuity = str(
+                item.get("first_frame_continuity", "")
+            ).strip()
+
+            motion_continuation = str(
+                item.get("motion_continuation", "")
+            ).strip()
+
+            final_frame = str(
+                item.get("final_frame", "")
+            ).strip()
+
             if not description:
                 raise ValueError(
                     f"Segment {expected_number} has no description."
@@ -1178,6 +1455,9 @@ Original video concept:
                     ],
                     description=description,
                     transition_note=transition_note,
+                    first_frame_continuity=first_frame_continuity,
+                    motion_continuation=motion_continuation,
+                    final_frame=final_frame,
                 )
             )
 
@@ -1192,6 +1472,9 @@ Original video concept:
                 "model": self.video_model,
                 "duration": segment.duration,
                 "description": segment.description,
+                "first_frame_continuity": segment.first_frame_continuity,
+                "motion_continuation": segment.motion_continuation,
+                "final_frame": segment.final_frame,
                 "transition_note": segment.transition_note,
             }
             for segment in segments
@@ -1349,16 +1632,108 @@ Original video concept:
     # Video generation
     # ------------------------------------------------------------------
 
+    def video_prompt_for_segment(self, segment):
+        """Build the Venice prompt with explicit continuity guidance."""
+        lines = []
+
+        if self.is_image_to_video:
+            lines.extend(
+                [
+                    (
+                        "Continue from the supplied input image as the "
+                        "exact first frame."
+                    ),
+                    (
+                        "Preserve the same character identity, clothing, "
+                        "pose, expression, body position, object positions, "
+                        "camera angle, lens, composition, lighting, color "
+                        "grade, and environment."
+                    ),
+                    (
+                        "Do not restart the scene, introduce a new "
+                        "establishing shot, or change the visual style."
+                    ),
+                ]
+            )
+            if self.reference_files:
+                tags = ", ".join(
+                    reference_image_tag(
+                        self.video_model,
+                        index,
+                    )
+                    for index in range(
+                        1,
+                        len(self.reference_files) + 1,
+                    )
+                )
+                lines.append(
+                    "Use the uploaded reference images as identity, "
+                    "object, scene, and style anchors. They are available "
+                    f"in order as {tags}; preserve their appearance when "
+                    "the prompt refers to them."
+                )
+        elif segment.number > 1:
+            lines.extend(
+                [
+                    (
+                        "Continue directly from the prior segment with no "
+                        "scene reset, recap, or time jump."
+                    ),
+                    (
+                        "Preserve character identity, clothing, location, "
+                        "lighting, camera style, and pacing from the "
+                        "previous segment."
+                    ),
+                ]
+            )
+
+        if segment.first_frame_continuity:
+            lines.append(
+                "First-frame continuity: "
+                + segment.first_frame_continuity
+            )
+
+        lines.append("Action: " + segment.description)
+
+        if segment.motion_continuation:
+            lines.append(
+                "Motion continuation: "
+                + segment.motion_continuation
+            )
+
+        final_frame = (
+            segment.final_frame
+            or segment.transition_note
+        )
+        if final_frame:
+            lines.append(
+                "End frame: " + final_frame
+            )
+
+        return "\n\n".join(lines)
+
+    def reference_image_payload_key(self):
+        """Return the model-specific flat reference-image field name."""
+        model_id = self.video_model.lower()
+        if "grok" in model_id:
+            return "referenceImageUrls"
+
+        return "reference_image_urls"
+
     def generate_video_segment(
         self,
         segment,
         output_path,
         source_data_url=None,
+        reference_data_urls=None,
     ):
         """Queue, poll, download, and save one video segment."""
+        video_prompt = self.video_prompt_for_segment(
+            segment
+        )
         payload = {
             "model": self.video_model,
-            "prompt": segment.description,
+            "prompt": video_prompt,
             "duration": segment.duration,
         }
 
@@ -1370,6 +1745,11 @@ Original video concept:
         elif self.video_aspect_ratio:
             payload["aspect_ratio"] = self.video_aspect_ratio
 
+        if reference_data_urls:
+            payload[
+                self.reference_image_payload_key()
+            ] = reference_data_urls
+
         # Deliberately omitted: audio, because model support varies.
 
         self.progress.emit(
@@ -1380,10 +1760,47 @@ Original video concept:
             ),
         )
 
-        queue_data = self.post_json(
-            VIDEO_QUEUE_URL,
-            payload,
-        )
+        try:
+            queue_data = self.post_json(
+                VIDEO_QUEUE_URL,
+                payload,
+            )
+        except VeniceAPIError as exc:
+            consent_info = self.seedance_consent_info(exc)
+            if consent_info is None:
+                raise
+
+            self.progress.emit(
+                segment.number - 1,
+                (
+                    f"Segment {segment.number}: Seedance face-media "
+                    "consent is required before queuing."
+                ),
+            )
+
+            if not self.request_seedance_consent(
+                segment.number,
+                consent_info,
+            ):
+                raise RuntimeError(
+                    "Seedance consent was not confirmed; generation stopped."
+                ) from exc
+
+            payload.setdefault("consents", {})
+            payload["consents"]["seedance"] = (
+                self.seedance_consent_payload()
+            )
+            self.progress.emit(
+                segment.number - 1,
+                (
+                    f"Segment {segment.number}: consent confirmed; "
+                    "resubmitting queue request."
+                ),
+            )
+            queue_data = self.post_json(
+                VIDEO_QUEUE_URL,
+                payload,
+            )
 
         queue_id = self.get_queue_id(queue_data)
         queued_model = str(
@@ -1972,6 +2389,27 @@ class VideoWindow(QMainWindow):
             self.choose_source_file
         )
 
+        self.reference_files_edit = QLineEdit()
+        self.reference_files_edit.setReadOnly(True)
+        self.reference_files_edit.setPlaceholderText(
+            "Optional for reference-to-video models"
+        )
+        self.reference_files = []
+
+        self.reference_files_button = QPushButton(
+            "Browse..."
+        )
+        self.reference_files_button.clicked.connect(
+            self.choose_reference_files
+        )
+
+        self.clear_reference_files_button = QPushButton(
+            "Clear"
+        )
+        self.clear_reference_files_button.clicked.connect(
+            self.clear_reference_files
+        )
+
         self.output_file_edit = QLineEdit()
         self.output_file_edit.setPlaceholderText(
             "Final output MP4 path"
@@ -2017,6 +2455,12 @@ class VideoWindow(QMainWindow):
         self.video_model_combo.addItem(
             DEFAULT_IMAGE_VIDEO_MODEL,
             DEFAULT_IMAGE_VIDEO_MODEL,
+        )
+        self.video_model_combo.currentIndexChanged.connect(
+            self.update_source_controls
+        )
+        self.video_model_combo.currentIndexChanged.connect(
+            lambda _index: self.update_reference_files_text()
         )
 
         self.refresh_models_button = QPushButton(
@@ -2090,6 +2534,18 @@ class VideoWindow(QMainWindow):
             self.source_file_button
         )
 
+        reference_row = QHBoxLayout()
+        reference_row.addWidget(
+            self.reference_files_edit,
+            1,
+        )
+        reference_row.addWidget(
+            self.reference_files_button
+        )
+        reference_row.addWidget(
+            self.clear_reference_files_button
+        )
+
         output_row = QHBoxLayout()
         output_row.addWidget(
             self.output_file_edit,
@@ -2120,6 +2576,10 @@ class VideoWindow(QMainWindow):
         form.addRow(
             "Starting image",
             source_row,
+        )
+        form.addRow(
+            "Reference images",
+            reference_row,
         )
         form.addRow(
             "Output MP4",
@@ -2291,6 +2751,80 @@ class VideoWindow(QMainWindow):
             self.output_file_edit.setText(
                 str(path)
             )
+
+    def choose_reference_files(self):
+        """Choose ordered reference images for R2V models."""
+        option = self.selected_video_option()
+        max_images = option.max_reference_images
+        if max_images <= 0:
+            QMessageBox.information(
+                self,
+                "Reference images unavailable",
+                (
+                    "The selected video model does not advertise "
+                    "flat reference-image support."
+                ),
+            )
+            return
+
+        filenames, _ = QFileDialog.getOpenFileNames(
+            self,
+            f"Choose up to {max_images} reference images",
+            "",
+            (
+                "Image files "
+                "(*.png *.jpg *.jpeg *.webp);;"
+                "All files (*)"
+            ),
+        )
+
+        if not filenames:
+            return
+
+        if len(filenames) > max_images:
+            QMessageBox.warning(
+                self,
+                "Too many reference images",
+                (
+                    f"The selected model supports up to {max_images} "
+                    "reference image(s). Extra images were ignored."
+                ),
+            )
+            filenames = filenames[:max_images]
+
+        self.reference_files = [
+            str(Path(filename))
+            for filename in filenames
+        ]
+        self.update_reference_files_text()
+
+    def clear_reference_files(self):
+        """Clear selected reference images."""
+        self.reference_files = []
+        self.update_reference_files_text()
+
+    def update_reference_files_text(self):
+        """Update the reference image summary field."""
+        if not self.reference_files:
+            self.reference_files_edit.clear()
+            self.update_source_controls()
+            return
+
+        option = self.selected_video_option()
+        names = [
+            (
+                f"{reference_image_tag(option.model_id, index)}="
+                f"{Path(path).name}"
+            )
+            for index, path in enumerate(
+                self.reference_files,
+                start=1,
+            )
+        ]
+        self.reference_files_edit.setText(
+            "; ".join(names)
+        )
+        self.update_source_controls()
 
     def load_prompt_text(self):
         """Load prompt text from a plain-text file."""
@@ -2511,6 +3045,41 @@ class VideoWindow(QMainWindow):
                 "Not used in text-to-video mode"
             )
 
+        option = self.selected_video_option()
+        reference_enabled = (
+            is_image_mode
+            and option.max_reference_images > 0
+            and not self.generating
+        )
+        self.reference_files_edit.setEnabled(
+            reference_enabled
+        )
+        self.reference_files_button.setEnabled(
+            reference_enabled
+        )
+        self.clear_reference_files_button.setEnabled(
+            reference_enabled
+            and bool(self.reference_files)
+        )
+
+        if option.max_reference_images > 0:
+            first_tag = reference_image_tag(
+                option.model_id,
+                1,
+            )
+            second_tag = reference_image_tag(
+                option.model_id,
+                2,
+            )
+            self.reference_files_edit.setPlaceholderText(
+                f"Optional; up to {option.max_reference_images} images "
+                f"as {first_tag}, {second_tag}, ..."
+            )
+        else:
+            self.reference_files_edit.setPlaceholderText(
+                "Only available for reference-to-video models"
+            )
+
     def load_video_models(self):
         """Load current video models into the dropdown."""
         if self.model_thread is not None:
@@ -2599,6 +3168,7 @@ class VideoWindow(QMainWindow):
 
         self.status_label.setText(message)
         self.append_log(message)
+        self.update_source_controls()
 
     def video_models_failed(self, message):
         """Report model-loading failures while preserving fallback model."""
@@ -2643,12 +3213,42 @@ class VideoWindow(QMainWindow):
         if not model_id:
             model_id = self.default_video_model()
 
+        model_id_lower = model_id.lower()
+        max_reference_images = (
+            7
+            if (
+                "reference-to-video" in model_id_lower
+                or "r2v" in model_id_lower
+            )
+            else 0
+        )
+        if "seedance" in model_id_lower:
+            max_reference_images = 9
+            durations = (
+                "10s",
+                "9s",
+                "8s",
+                "7s",
+                "6s",
+                "5s",
+                "4s",
+                "3s",
+                "2s",
+                "1s",
+            )
+            resolutions = ("1080p", "720p")
+        else:
+            durations = ("15s", "10s", "5s")
+            resolutions = (VIDEO_RESOLUTION, "720p")
+
         return VideoModelOption(
             model_id=model_id,
             label=model_id,
-            durations=("15s", "10s", "5s"),
-            resolutions=(VIDEO_RESOLUTION, "720p"),
+            preferred=is_preferred_video_model_id(model_id_lower),
+            durations=durations,
+            resolutions=resolutions,
             aspect_ratios=(VIDEO_ASPECT_RATIO,),
+            max_reference_images=max_reference_images,
         )
 
     def selected_video_model(self):
@@ -2687,6 +3287,7 @@ class VideoWindow(QMainWindow):
         generation_mode = self.selected_generation_mode()
         video_option = self.selected_video_option()
         video_model = video_option.model_id
+        reference_files = list(self.reference_files)
         total_seconds = self.output_seconds_spin.value()
         try:
             segment_durations = (
@@ -2772,6 +3373,57 @@ class VideoWindow(QMainWindow):
                 f"The selected file does not exist:\n{source_file}",
             )
             return
+
+        if reference_files:
+            if generation_mode != IMAGE_TO_VIDEO_MODE:
+                QMessageBox.warning(
+                    self,
+                    "Reference images unavailable",
+                    (
+                        "Reference images can only be used in "
+                        "image-to-video mode."
+                    ),
+                )
+                return
+
+            if video_option.max_reference_images <= 0:
+                QMessageBox.warning(
+                    self,
+                    "Reference images unavailable",
+                    (
+                        "The selected video model does not advertise "
+                        "flat reference-image support."
+                    ),
+                )
+                return
+
+            if len(reference_files) > video_option.max_reference_images:
+                QMessageBox.warning(
+                    self,
+                    "Too many reference images",
+                    (
+                        f"The selected model supports up to "
+                        f"{video_option.max_reference_images} "
+                        "reference image(s)."
+                    ),
+                )
+                return
+
+            missing_reference_files = [
+                path
+                for path in reference_files
+                if not Path(path).is_file()
+            ]
+            if missing_reference_files:
+                QMessageBox.warning(
+                    self,
+                    "Invalid reference image",
+                    (
+                        "The selected reference file does not exist:\n"
+                        + missing_reference_files[0]
+                    ),
+                )
+                return
 
         if not prompt:
             QMessageBox.warning(
@@ -2859,6 +3511,20 @@ class VideoWindow(QMainWindow):
             self.append_log(
                 "Continuity: each segment uses the preceding final frame"
             )
+            if reference_files:
+                self.append_log(
+                    "Reference images: "
+                    + "; ".join(
+                        (
+                            f"{reference_image_tag(video_model, index)}="
+                            f"{Path(path).name}"
+                        )
+                        for index, path in enumerate(
+                            reference_files,
+                            start=1,
+                        )
+                    )
+                )
         else:
             self.append_log(
                 "Continuity: each segment prompt continues the previous one"
@@ -2888,6 +3554,7 @@ class VideoWindow(QMainWindow):
             segment_durations=segment_durations,
             video_resolution=video_resolution,
             video_aspect_ratio=video_aspect_ratio,
+            reference_files=reference_files,
             retain_intermediate_files=retain_intermediate_files,
         )
 
@@ -2905,6 +3572,10 @@ class VideoWindow(QMainWindow):
 
         self.worker.segment_ready.connect(
             self.segment_ready
+        )
+
+        self.worker.seedance_consent_required.connect(
+            self.handle_seedance_consent_required
         )
 
         self.worker.finished.connect(
@@ -2948,6 +3619,53 @@ class VideoWindow(QMainWindow):
         self.append_log(
             f"Saved {Path(path).name}"
         )
+
+    def handle_seedance_consent_required(
+        self,
+        segment_number,
+        policy_text,
+        roles_text,
+        docs_url,
+    ):
+        """Show Seedance face-media consent and notify the worker."""
+        checkbox = QCheckBox(
+            (
+                "I confirm these terms, legal likeness rights, "
+                "and screening acknowledgement."
+            )
+        )
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Warning)
+        message.setWindowTitle("Seedance consent required")
+        message.setText(
+            f"Seedance detected face-bearing media in segment {segment_number}."
+        )
+        details = policy_text
+        if roles_text:
+            details += f"\n\nDetected media roles: {roles_text}"
+        if docs_url:
+            details += f"\n\nDocs: {docs_url}"
+        message.setInformativeText(details)
+        message.setCheckBox(checkbox)
+        message.setStandardButtons(
+            QMessageBox.Ok | QMessageBox.Cancel
+        )
+        message.setDefaultButton(QMessageBox.Cancel)
+
+        accepted = (
+            message.exec() == QMessageBox.Ok
+            and checkbox.isChecked()
+        )
+
+        if not accepted:
+            self.append_log(
+                "Seedance consent was not confirmed."
+            )
+
+        if self.worker is not None:
+            self.worker.set_seedance_consent_response(
+                accepted
+            )
 
     def generation_finished(self, final_path):
         """Handle successful generation."""

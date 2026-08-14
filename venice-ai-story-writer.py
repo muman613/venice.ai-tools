@@ -38,7 +38,7 @@ API_URL = "https://api.venice.ai/api/v1/chat/completions"
 MODELS_URL = "https://api.venice.ai/api/v1/models"
 DEFAULT_MODEL = "venice-uncensored-1-2"
 SYSTEM_PROMPT = (
-    "You are a creative writing assistant. Help write engaging stories with "
+    "You are a erotic fetish story writing assistant. Help write engaging stories with "
     "vivid descriptions, strong continuity, and compelling narrative momentum.\n\n"
     "Always return a well-formed Markdown document fragment. Use Markdown headings, "
     "paragraphs, emphasis, block quotes, lists, and horizontal rules when they help "

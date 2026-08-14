@@ -51,6 +51,7 @@ SETTINGS_ORG = "VeniceAI"
 SETTINGS_APP = "ImageGeneration"
 OUTPUT_DIR_SETTING = "paths/output_dir"
 PROMPT_DIR_SETTING = "paths/prompt_dir"
+GENERATION_LOG_FILENAME = "venice-image-gen.log"
 
 SIZING_WIDTH_HEIGHT = "width_height"
 SIZING_ASPECT_RATIO = "aspect_ratio"
@@ -70,6 +71,7 @@ class ImageModelOption:
 
     model_id: str
     label: str
+    pricing: object = None
 
 
 class VeniceAPIError(RuntimeError):
@@ -127,6 +129,18 @@ def model_display_name(model):
     return str(value).strip() if value else ""
 
 
+def model_pricing(model):
+    """Return image generation pricing metadata from a model object."""
+    if not isinstance(model, dict):
+        return None
+
+    model_spec = model.get("model_spec")
+    if isinstance(model_spec, dict) and model_spec.get("pricing"):
+        return model_spec["pricing"]
+
+    return model.get("pricing")
+
+
 def extract_image_models(data):
     """Extract image-generation models from the models response."""
     options = []
@@ -142,7 +156,7 @@ def extract_image_models(data):
 
         display_name = model_display_name(model)
         label = model_id if not display_name else f"{display_name} ({model_id})"
-        options.append(ImageModelOption(model_id, label))
+        options.append(ImageModelOption(model_id, label, model_pricing(model)))
 
     options.sort(key=lambda option: option.label.lower())
     return options
@@ -207,6 +221,132 @@ def add_png_description(image_bytes, description):
         offset = chunk_end
 
     return image_bytes
+
+
+def usd_amount(value):
+    """Return a USD float from Venice pricing metadata."""
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if isinstance(value, str):
+        try:
+            return float(value.strip().lstrip("$"))
+        except ValueError:
+            return None
+
+    if isinstance(value, dict):
+        for key in ("usd", "USD", "amount", "price", "cost"):
+            amount = usd_amount(value.get(key))
+            if amount is not None:
+                return amount
+
+    return None
+
+
+def image_unit_price(pricing, payload):
+    """Return a per-image USD price and label for a generation payload."""
+    if not isinstance(pricing, dict):
+        return None, "No pricing metadata loaded for this model."
+
+    resolution = str(payload.get("resolution", "")).strip()
+    quality = str(payload.get("quality") or "high").strip().lower()
+
+    quality_prices = pricing.get("quality")
+    if isinstance(quality_prices, dict):
+        if not resolution:
+            return None, "Choose a resolution tier to estimate this model."
+
+        resolution_prices = quality_prices.get(resolution)
+        if isinstance(resolution_prices, dict):
+            amount = usd_amount(resolution_prices.get(quality))
+            if amount is not None:
+                return amount, f"{resolution} {quality}"
+
+            available = ", ".join(sorted(str(key) for key in resolution_prices))
+            return None, f"Quality {quality!r} is not priced. Available: {available}."
+
+        return None, f"Resolution {resolution!r} is not priced for this model."
+
+    resolution_prices = pricing.get("resolutions")
+    if isinstance(resolution_prices, dict):
+        if not resolution:
+            return None, "Choose a resolution tier to estimate this model."
+
+        amount = usd_amount(resolution_prices.get(resolution))
+        if amount is not None:
+            return amount, resolution
+
+        return None, f"Resolution {resolution!r} is not priced for this model."
+
+    amount = usd_amount(pricing.get("generation"))
+    if amount is not None:
+        return amount, "per image"
+
+    amount = usd_amount(pricing)
+    if amount is not None:
+        return amount, "per image"
+
+    return None, "No generation price found in model metadata."
+
+
+def generation_cost_summary(pricing, payload):
+    """Return estimated cost details for an image generation payload."""
+    unit_price, basis = image_unit_price(pricing, payload)
+    variants = max(1, int(payload.get("variants") or 1))
+    if unit_price is None:
+        return {
+            "available": False,
+            "basis": basis,
+            "variants": variants,
+            "unit_price": None,
+            "total": None,
+            "display": f"unavailable ({basis})",
+        }
+
+    total = unit_price * variants
+    if variants == 1:
+        display = f"${total:.4f} ({basis})"
+    else:
+        display = f"${total:.4f} ({variants} x ${unit_price:.4f}, {basis})"
+
+    return {
+        "available": True,
+        "basis": basis,
+        "variants": variants,
+        "unit_price": unit_price,
+        "total": total,
+        "display": display,
+    }
+
+
+def append_generation_log(output_dir, entry):
+    """Append a completed generation entry to the output directory log."""
+    log_path = Path(output_dir) / GENERATION_LOG_FILENAME
+    lines = [
+        "Venice image generation",
+        f"Timestamp: {entry['timestamp']}",
+        f"Model: {entry['model']}",
+        f"Estimated cost: {entry['estimated_cost']['display']}",
+    ]
+
+    if entry.get("enhanced_prompt"):
+        lines.append(f"Enhanced prompt: {entry['enhanced_prompt']}")
+
+    lines.extend(
+        (
+            "Parameters:",
+            json.dumps(entry["parameters"], indent=2, sort_keys=True),
+            "Generated files:",
+        )
+    )
+    lines.extend(f"- {path}" for path in entry["generated_files"])
+    lines.append("")
+    lines.append("")
+
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write("\n".join(lines))
+
+    return log_path
 
 
 class MetadataWorker(QObject):
@@ -327,6 +467,7 @@ class ImageGenerationWindow(QMainWindow):
         self.metadata_worker = None
         self.generation_thread = None
         self.generation_worker = None
+        self.active_generation_log = None
         self.generated_paths = []
         self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
@@ -340,7 +481,9 @@ class ImageGenerationWindow(QMainWindow):
 
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
-        self.model_combo.addItem(DEFAULT_MODEL, DEFAULT_MODEL)
+        self.model_combo.addItem(DEFAULT_MODEL, ImageModelOption(DEFAULT_MODEL, DEFAULT_MODEL))
+        self.model_combo.currentIndexChanged.connect(self.update_cost_estimate)
+        self.model_combo.editTextChanged.connect(self.update_cost_estimate)
 
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.refresh_metadata)
@@ -376,17 +519,21 @@ class ImageGenerationWindow(QMainWindow):
         self.width_spin.setRange(64, 1280)
         self.width_spin.setSingleStep(64)
         self.width_spin.setValue(1024)
+        self.width_spin.valueChanged.connect(self.update_cost_estimate)
 
         self.height_spin = QSpinBox()
         self.height_spin.setRange(64, 1280)
         self.height_spin.setSingleStep(64)
         self.height_spin.setValue(1024)
+        self.height_spin.valueChanged.connect(self.update_cost_estimate)
 
         self.aspect_ratio_combo = QComboBox()
         self.aspect_ratio_combo.addItems(("1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"))
+        self.aspect_ratio_combo.currentIndexChanged.connect(self.update_cost_estimate)
 
         self.resolution_combo = QComboBox()
         self.resolution_combo.addItems(("1K", "2K", "4K"))
+        self.resolution_combo.currentIndexChanged.connect(self.update_cost_estimate)
 
         self.format_combo = QComboBox()
         self.format_combo.addItems(("webp", "png", "jpeg"))
@@ -394,10 +541,12 @@ class ImageGenerationWindow(QMainWindow):
         self.quality_combo = QComboBox()
         self.quality_combo.addItem("Default", "")
         self.quality_combo.addItems(("low", "medium", "high"))
+        self.quality_combo.currentIndexChanged.connect(self.update_cost_estimate)
 
         self.variants_spin = QSpinBox()
         self.variants_spin.setRange(1, 4)
         self.variants_spin.setValue(1)
+        self.variants_spin.valueChanged.connect(self.update_cost_estimate)
 
         self.steps_spin = QSpinBox()
         self.steps_spin.setRange(1, 150)
@@ -440,6 +589,9 @@ class ImageGenerationWindow(QMainWindow):
         self.status_label = QLabel("Ready")
         self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
+        self.cost_label = QLabel("Estimated cost: unavailable until model metadata loads.")
+        self.cost_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
         self.preview_label = QLabel("Generated image preview")
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumSize(320, 240)
@@ -451,6 +603,7 @@ class ImageGenerationWindow(QMainWindow):
         self.apply_style()
         self.update_sizing_controls()
         self.update_description_controls()
+        self.update_cost_estimate()
         # Automatically refresh model/style metadata on startup when an API key is available
         try:
             if self.api_key_edit.text().strip():
@@ -466,6 +619,10 @@ class ImageGenerationWindow(QMainWindow):
         save_action = QAction("Save Prompt...", self)
         save_action.triggered.connect(self.save_prompt)
         prompt_menu.addAction(save_action)
+
+        save_txt_action = QAction("Save Prompt as TXT...", self)
+        save_txt_action.triggered.connect(self.save_prompt_txt)
+        prompt_menu.addAction(save_txt_action)
 
         load_action = QAction("Load Prompt...", self)
         load_action.triggered.connect(self.load_prompt)
@@ -521,6 +678,8 @@ class ImageGenerationWindow(QMainWindow):
         params_grid.addWidget(self.cfg_spin, 3, 3)
         params_grid.addWidget(QLabel("Seed"), 3, 4)
         params_grid.addWidget(self.seed_spin, 3, 5)
+        params_grid.addWidget(QLabel("Cost"), 4, 0)
+        params_grid.addWidget(self.cost_label, 4, 1, 1, 5)
         params_grid.setColumnStretch(1, 1)
         params_grid.setColumnStretch(3, 1)
         params_grid.setColumnStretch(5, 1)
@@ -738,16 +897,18 @@ class ImageGenerationWindow(QMainWindow):
     def metadata_loaded(self, models, styles):
         """Populate model and style controls."""
         current_model = self.selected_model()
+        self.model_combo.blockSignals(True)
         self.model_combo.clear()
         if models:
             for option in models:
-                self.model_combo.addItem(option.label, option.model_id)
+                self.model_combo.addItem(option.label, option)
             if current_model:
-                index = self.model_combo.findData(current_model)
+                index = self.find_model_index(current_model)
                 if index >= 0:
                     self.model_combo.setCurrentIndex(index)
         else:
-            self.model_combo.addItem(DEFAULT_MODEL, DEFAULT_MODEL)
+            self.model_combo.addItem(DEFAULT_MODEL, ImageModelOption(DEFAULT_MODEL, DEFAULT_MODEL))
+        self.model_combo.blockSignals(False)
 
         self.style_combo.clear()
         self.style_combo.addItem("None", "")
@@ -756,6 +917,7 @@ class ImageGenerationWindow(QMainWindow):
 
         self.refresh_button.setEnabled(True)
         self.status_label.setText(f"Loaded {self.model_combo.count()} image models and {len(styles)} styles.")
+        self.update_cost_estimate()
 
     def metadata_failed(self, message):
         """Show metadata loading errors."""
@@ -781,9 +943,9 @@ class ImageGenerationWindow(QMainWindow):
         self.settings.setValue(OUTPUT_DIR_SETTING, dirname)
 
     def save_prompt(self):
-        """Save prompt fields to a JSON file."""
+        """Save prompt fields to a JSON or text file."""
         prompt_dir = self.settings.value(PROMPT_DIR_SETTING, str(Path.cwd()), str)
-        filename, _ = QFileDialog.getSaveFileName(
+        filename, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Save prompt",
             str(Path(prompt_dir) / "image-prompt.json"),
@@ -794,6 +956,11 @@ class ImageGenerationWindow(QMainWindow):
 
         try:
             path = Path(filename)
+            if not path.suffix:
+                if selected_filter.startswith("Text"):
+                    path = path.with_suffix(".txt")
+                elif selected_filter.startswith("Prompt JSON"):
+                    path = path.with_suffix(".json")
             self.settings.setValue(PROMPT_DIR_SETTING, str(path.parent))
             if path.suffix.lower() == ".txt":
                 path.write_text(self.prompt_edit.toPlainText(), encoding="utf-8")
@@ -809,6 +976,28 @@ class ImageGenerationWindow(QMainWindow):
             self.status_label.setText(f"Saved prompt: {path}")
         except OSError as exc:
             QMessageBox.critical(self, "Save prompt failed", str(exc))
+
+    def save_prompt_txt(self):
+        """Save only the image prompt as a plain text file."""
+        prompt_dir = self.settings.value(PROMPT_DIR_SETTING, str(Path.cwd()), str)
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save prompt as TXT",
+            str(Path(prompt_dir) / "image-prompt.txt"),
+            "Text files (*.txt);;All files (*)",
+        )
+        if not filename:
+            return
+
+        try:
+            path = Path(filename)
+            if not path.suffix:
+                path = path.with_suffix(".txt")
+            self.settings.setValue(PROMPT_DIR_SETTING, str(path.parent))
+            path.write_text(self.prompt_edit.toPlainText(), encoding="utf-8")
+            self.status_label.setText(f"Saved prompt TXT: {path}")
+        except OSError as exc:
+            QMessageBox.critical(self, "Save prompt TXT failed", str(exc))
 
     def load_prompt(self):
         """Load prompt fields from a JSON or plain text file."""
@@ -848,6 +1037,7 @@ class ImageGenerationWindow(QMainWindow):
         self.height_spin.setEnabled(mode == SIZING_WIDTH_HEIGHT)
         self.aspect_ratio_combo.setEnabled(mode in {SIZING_ASPECT_RATIO, SIZING_RESOLUTION_ASPECT})
         self.resolution_combo.setEnabled(mode == SIZING_RESOLUTION_ASPECT)
+        self.update_cost_estimate()
 
     def update_description_controls(self):
         """Enable description text only when PNG metadata is requested."""
@@ -856,9 +1046,50 @@ class ImageGenerationWindow(QMainWindow):
     def selected_model(self):
         """Return the selected or typed model ID."""
         data = self.model_combo.currentData()
+        if isinstance(data, ImageModelOption):
+            current_text = self.model_combo.currentText().strip()
+            if current_text and current_text not in {data.label, data.model_id}:
+                return current_text
+            return data.model_id
         if data:
             return str(data).strip()
         return self.model_combo.currentText().strip()
+
+    def selected_model_option(self):
+        """Return pricing metadata for the selected model when available."""
+        model_id = self.selected_model()
+        data = self.model_combo.currentData()
+        if isinstance(data, ImageModelOption) and data.model_id == model_id:
+            return data
+
+        index = self.find_model_index(model_id)
+        if index >= 0:
+            option = self.model_combo.itemData(index)
+            if isinstance(option, ImageModelOption):
+                return option
+
+        return ImageModelOption(model_id, model_id)
+
+    def find_model_index(self, model_id):
+        """Find a loaded model option by ID."""
+        for index in range(self.model_combo.count()):
+            option = self.model_combo.itemData(index)
+            if isinstance(option, ImageModelOption):
+                if option.model_id == model_id:
+                    return index
+            elif option == model_id:
+                return index
+        return -1
+
+    def update_cost_estimate(self, *_args):
+        """Display the estimated image generation cost."""
+        if not hasattr(self, "cost_label"):
+            return
+
+        payload = self.generation_payload()
+        option = self.selected_model_option()
+        cost = generation_cost_summary(option.pricing, payload)
+        self.cost_label.setText(f"Estimated cost: {cost['display']}")
 
     def generation_payload(self):
         """Build a Venice /image/generate JSON payload from the form."""
@@ -932,6 +1163,15 @@ class ImageGenerationWindow(QMainWindow):
             QMessageBox.warning(self, "Missing output directory", "Choose an output directory first.")
             return
 
+        option = self.selected_model_option()
+        self.active_generation_log = {
+            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "model": payload["model"],
+            "parameters": dict(payload),
+            "estimated_cost": generation_cost_summary(option.pricing, payload),
+            "output_dir": output_dir,
+        }
+
         self.set_generating(True)
         self.progress.setRange(0, 0)
         self.status_label.setText("Generating image...")
@@ -961,12 +1201,25 @@ class ImageGenerationWindow(QMainWindow):
         new_paths = list(paths)
         self.generated_paths.extend(new_paths)
 
+        first_new_row = self.output_list.count()
         self.output_list.blockSignals(True)
         self.output_list.addItems(new_paths)
         self.output_list.blockSignals(False)
 
         if new_paths:
-            self.display_image(new_paths[0])
+            self.output_list.setCurrentRow(first_new_row)
+            self.output_list.scrollToItem(self.output_list.item(first_new_row))
+
+        log_path = None
+        log_error = None
+        if self.active_generation_log and new_paths:
+            try:
+                entry = dict(self.active_generation_log)
+                entry["enhanced_prompt"] = enhanced_prompt
+                entry["generated_files"] = new_paths
+                log_path = append_generation_log(entry["output_dir"], entry)
+            except OSError as exc:
+                log_error = str(exc)
 
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
@@ -974,9 +1227,15 @@ class ImageGenerationWindow(QMainWindow):
         self.set_generating(False)
 
         message = f"Saved {len(new_paths)} image file(s)."
+        if log_path:
+            message += f" Log: {log_path}"
         if enhanced_prompt:
             message += " Enhanced prompt returned in the response headers."
+        if log_error:
+            message += " Log write failed."
         self.status_label.setText(message)
+        if log_error:
+            QMessageBox.warning(self, "Log write failed", log_error)
 
     def generation_failed(self, message):
         """Display image generation errors."""
@@ -990,6 +1249,7 @@ class ImageGenerationWindow(QMainWindow):
         """Clear finished generation worker references."""
         self.generation_thread = None
         self.generation_worker = None
+        self.active_generation_log = None
 
     def preview_selected_image(self, _row=None):
         """Preview the selected generated image."""
