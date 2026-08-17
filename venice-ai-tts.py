@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Qt GUI for queueing text files for Venice AI speech MP3 conversion."""
 
+import logging
+import os
+import shlex
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -9,6 +13,7 @@ from PySide6.QtCore import QObject, QSettings, QThread, QUrl, Signal
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -26,13 +31,24 @@ from PySide6.QtWidgets import (
 )
 
 from modules.html_text_extractor import extract_text
-from modules.tts import VALID_VOICES, TextToSpeechError, text_file_to_mp3
+from modules.tts import (
+    TTS_MODELS,
+    TextToSpeechError,
+    default_voice_for_model,
+    model_label,
+    text_file_to_mp3,
+    voices_for_model,
+)
 
 
 ORGANIZATION_NAME = "venice-ai-tools"
 APPLICATION_NAME = "venice-ai-tts"
 SOURCE_DIR_SETTING = "paths/source_dir"
 OUTPUT_DIR_SETTING = "paths/output_dir"
+REVIEW_HTML_SETTING = "html/review_extracted_text"
+TTS_MODEL_SETTING = "tts/model"
+LOG_FILE = Path(__file__).with_name("venice-ai-tts.log")
+LOGGER = logging.getLogger(__name__)
 
 
 class TtsWorker(QObject):
@@ -42,33 +58,39 @@ class TtsWorker(QObject):
     failed = Signal(int, str)
     finished = Signal(int, str)
 
-    def __init__(self, queue_index, source_file, output_dir, voice_id):
+    def __init__(self, queue_index, source_file, output_dir, model, voice_id, review_html):
         super().__init__()
         self.queue_index = queue_index
         self.source_file = Path(source_file)
         self.output_dir = Path(output_dir)
+        self.model = model
         self.voice_id = voice_id
+        self.review_html = review_html
 
     def run(self):
         """Convert the selected file and report completion."""
         cleanup_text_file = False
+        text_file = None
         try:
             text_file, output_file, cleanup_text_file = prepare_source_text(
                 self.source_file,
                 self.output_dir,
                 self.emit_progress,
+                review_html=self.review_html,
             )
             output_path = text_file_to_mp3(
                 text_file,
                 output_file,
                 self.voice_id,
+                model=self.model,
                 progress_callback=self.emit_progress,
             )
         except (OSError, TextToSpeechError) as exc:
+            LOGGER.exception("TTS queue item failed: source=%s", self.source_file)
             self.failed.emit(self.queue_index, str(exc))
             return
         finally:
-            if cleanup_text_file:
+            if cleanup_text_file and text_file:
                 Path(text_file).unlink(missing_ok=True)
         self.finished.emit(self.queue_index, str(output_path))
 
@@ -77,7 +99,7 @@ class TtsWorker(QObject):
         self.progress_changed.emit(self.queue_index, current, total, message)
 
 
-def prepare_source_text(source_file, output_dir, progress_callback=None):
+def prepare_source_text(source_file, output_dir, progress_callback=None, *, review_html=False):
     """Return the text file to convert and the final MP3 output path."""
     if not source_file.is_file():
         raise TextToSpeechError(f"Input file does not exist: {source_file}")
@@ -90,6 +112,20 @@ def prepare_source_text(source_file, output_dir, progress_callback=None):
         if progress_callback:
             progress_callback(0, 1, f"Extracting text from {source_file.name}")
         extracted_text = extract_text(source_file)
+        LOGGER.info(
+            "Extracted HTML text: source=%s chars=%s review=%s",
+            source_file,
+            len(extracted_text),
+            review_html,
+        )
+        if review_html:
+            editable_text_file = output_dir / f"{source_file.stem}.txt"
+            editable_text_file.write_text(extracted_text, encoding="utf-8")
+            if progress_callback:
+                progress_callback(0, 1, f"Reviewing {editable_text_file.name}")
+            open_text_for_review(editable_text_file)
+            return editable_text_file, output_file, False
+
         with tempfile.NamedTemporaryFile(
             "w",
             delete=False,
@@ -104,6 +140,22 @@ def prepare_source_text(source_file, output_dir, progress_callback=None):
         return source_file, output_file, False
 
     raise TextToSpeechError(f"Choose a .txt, .html, or .htm file: {source_file}")
+
+
+def open_text_for_review(text_file):
+    """Open extracted text in an external editor and wait for the user to close it."""
+    editor = os.environ.get("VENICE_TTS_EDITOR") or os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    command = shlex.split(editor) if editor else ["gedit", "--wait"]
+    LOGGER.info("Opening extracted HTML text for review: command=%s file=%s", command, text_file)
+    try:
+        subprocess.run([*command, str(text_file)], check=True)
+    except FileNotFoundError as exc:
+        raise TextToSpeechError(
+            "Could not open the extracted HTML text for review. "
+            "Install gedit, set VENICE_TTS_EDITOR, or disable HTML review."
+        ) from exc
+    except subprocess.SubprocessError as exc:
+        raise TextToSpeechError(f"HTML text review editor failed: {exc}") from exc
 
 
 class TextToSpeechWindow(QMainWindow):
@@ -130,8 +182,19 @@ class TextToSpeechWindow(QMainWindow):
         self.output_file_edit = QLineEdit()
         self.output_file_edit.setReadOnly(True)
 
+        self.model_combo = QComboBox()
+        for model in TTS_MODELS:
+            self.model_combo.addItem(model_label(model), model)
+        self.model_combo.currentIndexChanged.connect(self.model_selection_changed)
+
         self.voice_combo = QComboBox()
-        self.voice_combo.addItems(VALID_VOICES)
+        self.voice_combo.setEditable(True)
+
+        self.review_html_check = QCheckBox("Review extracted HTML text")
+        self.review_html_check.setChecked(
+            self.settings.value(REVIEW_HTML_SETTING, True, bool)
+        )
+        self.review_html_check.stateChanged.connect(self.save_review_html_setting)
 
         self.browse_button = QPushButton("Choose Input Files")
         self.browse_button.clicked.connect(self.choose_source_files)
@@ -171,7 +234,9 @@ class TextToSpeechWindow(QMainWindow):
         form.addRow("Input files", self.row(self.source_file_edit, self.browse_button))
         form.addRow("Output directory", self.row(self.output_dir_edit, self.output_button))
         form.addRow("Output MP3", self.output_file_edit)
+        form.addRow("Model", self.model_combo)
         form.addRow("Voice", self.voice_combo)
+        form.addRow("", self.review_html_check)
 
         controls = QHBoxLayout()
         controls.addWidget(self.convert_button)
@@ -191,6 +256,7 @@ class TextToSpeechWindow(QMainWindow):
         central.setLayout(layout)
         self.setCentralWidget(central)
         self.restore_saved_paths()
+        self.restore_saved_model()
 
     def apply_style(self):
         """Apply dark GUI styling."""
@@ -342,6 +408,41 @@ class TextToSpeechWindow(QMainWindow):
         """Remember the destination directory."""
         self.settings.setValue(OUTPUT_DIR_SETTING, str(output_dir))
 
+    def save_review_html_setting(self):
+        """Remember whether extracted HTML should be reviewed before conversion."""
+        self.settings.setValue(REVIEW_HTML_SETTING, self.review_html_check.isChecked())
+
+    def current_model(self):
+        """Return the selected Venice TTS model ID."""
+        return self.model_combo.currentData() or self.model_combo.currentText()
+
+    def restore_saved_model(self):
+        """Restore the remembered TTS model and initialize voice choices."""
+        saved_model = self.settings.value(TTS_MODEL_SETTING, TTS_MODELS[0], str)
+        model_index = self.model_combo.findData(saved_model)
+        if model_index >= 0:
+            self.model_combo.setCurrentIndex(model_index)
+        self.update_voice_options()
+
+    def model_selection_changed(self):
+        """Persist model selection and refresh model-specific voices."""
+        self.settings.setValue(TTS_MODEL_SETTING, self.current_model())
+        self.update_voice_options()
+
+    def update_voice_options(self):
+        """Refresh the voice choices for the selected model."""
+        model = self.current_model()
+        current_voice = self.voice_combo.currentText().strip()
+        self.voice_combo.blockSignals(True)
+        self.voice_combo.clear()
+        self.voice_combo.addItems(voices_for_model(model))
+        voice_index = self.voice_combo.findText(current_voice)
+        if voice_index >= 0:
+            self.voice_combo.setCurrentIndex(voice_index)
+        else:
+            self.voice_combo.setCurrentText(default_voice_for_model(model))
+        self.voice_combo.blockSignals(False)
+
     def add_selected_to_queue(self):
         """Add selected files to the conversion queue."""
         output_dir = self.output_dir_edit.text().strip()
@@ -361,7 +462,9 @@ class TextToSpeechWindow(QMainWindow):
             return
         self.update_output_file()
 
+        model = self.current_model()
         voice_id = self.voice_combo.currentText()
+        review_html = self.review_html_check.isChecked()
         for filename in self.selected_source_files:
             source_file = Path(filename)
             output_file = Path(output_dir) / f"{source_file.stem}.mp3"
@@ -371,7 +474,9 @@ class TextToSpeechWindow(QMainWindow):
                 {
                     "source_file": source_file,
                     "output_dir": Path(output_dir),
+                    "model": model,
                     "voice_id": voice_id,
+                    "review_html": review_html,
                     "output_file": output_file,
                     "list_item": queue_item,
                     "status": "queued",
@@ -409,7 +514,9 @@ class TextToSpeechWindow(QMainWindow):
             next_index,
             queue_item["source_file"],
             queue_item["output_dir"],
+            queue_item["model"],
             queue_item["voice_id"],
+            queue_item["review_html"],
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -524,13 +631,28 @@ class TextToSpeechWindow(QMainWindow):
         self.convert_button.setEnabled(True)
         self.browse_button.setEnabled(True)
         self.output_button.setEnabled(True)
+        self.model_combo.setEnabled(True)
         self.voice_combo.setEnabled(True)
         if processing:
             self.pause_button.setEnabled(False)
 
 
+def configure_logging():
+    """Write TTS diagnostics to a local log file and stderr."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+    LOGGER.info("Starting venice-ai-tts; log_file=%s", LOG_FILE)
+
+
 def main():
     """Run the Venice AI text-to-speech GUI."""
+    configure_logging()
     app = QApplication(sys.argv)
     window = TextToSpeechWindow()
     window.show()

@@ -98,7 +98,7 @@ Run the text-to-speech GUI:
 python venice-ai-tts.py
 ```
 
-Choose one or more `.txt`, `.html`, or `.htm` files, select an output directory and voice, then add them to the queue. Files are converted to MP3s in order in the background, and the queue list shows running, completed, and failed items. HTML files are extracted to text automatically before conversion.
+Choose one or more `.txt`, `.html`, or `.htm` files, select an output directory, model, and voice, then add them to the queue. The TTS GUI supports Kokoro and Venice-hosted ElevenLabs Turbo v2.5. For ElevenLabs, choose a built-in voice or type a raw ElevenLabs voice ID into the editable voice box. Files are converted to MP3s in order in the background, and the queue list shows running, completed, and failed items. HTML files can be reviewed as extracted text before conversion. TTS diagnostics are written to `venice-ai-tts.log`; set `VENICE_TTS_TIMEOUT` or `VENICE_TTS_CHUNK_SIZE` to override the default 180-second request timeout and 1800-character chunk size.
 
 Run the model listing helper:
 

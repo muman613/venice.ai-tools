@@ -1,17 +1,68 @@
 """Text-to-speech helpers for Venice AI audio generation."""
 
 import os
+import logging
 import time
 from pathlib import Path
 
 import requests
 
 
+def env_int(name, default):
+    """Return a positive integer from the environment or a safe default."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
 API_BASE_URL = "https://api.venice.ai/api/v1"
 DEFAULT_MODEL = "tts-kokoro"
-DEFAULT_CHUNK_SIZE = 4000
+ELEVENLABS_TURBO_MODEL = "tts-elevenlabs-turbo-v2-5"
+TTS_MODELS = (DEFAULT_MODEL, ELEVENLABS_TURBO_MODEL)
+TTS_MODEL_LABELS = {
+    DEFAULT_MODEL: "Kokoro",
+    ELEVENLABS_TURBO_MODEL: "ElevenLabs Turbo v2.5",
+}
+DEFAULT_CHUNK_SIZE = env_int("VENICE_TTS_CHUNK_SIZE", 1800)
 DEFAULT_DELAY_SECONDS = 1.0
+DEFAULT_TIMEOUT_SECONDS = env_int("VENICE_TTS_TIMEOUT", 180)
 VALID_VOICES = ("default", "alloy", "echo", "fable", "onyx", "nova", "shimmer")
+ELEVENLABS_TURBO_VOICES = (
+    "Alice",
+    "Aria",
+    "Bill",
+    "Brian",
+    "Callum",
+    "Charlie",
+    "Charlotte",
+    "Chris",
+    "Daniel",
+    "Eric",
+    "George",
+    "Jessica",
+    "Laura",
+    "Liam",
+    "Lily",
+    "Matilda",
+    "Rachel",
+    "River",
+    "Roger",
+    "Sarah",
+    "Will",
+)
+DEFAULT_VOICE_BY_MODEL = {
+    DEFAULT_MODEL: "default",
+    ELEVENLABS_TURBO_MODEL: "Rachel",
+}
+VOICES_BY_MODEL = {
+    DEFAULT_MODEL: VALID_VOICES,
+    ELEVENLABS_TURBO_MODEL: ELEVENLABS_TURBO_VOICES,
+}
 VENICE_VOICE_ALIASES = {
     "default": "af_sky",
     "alloy": "af_alloy",
@@ -21,6 +72,7 @@ VENICE_VOICE_ALIASES = {
     "nova": "af_nova",
     "shimmer": "af_sky",
 }
+LOGGER = logging.getLogger(__name__)
 
 
 class TextToSpeechError(RuntimeError):
@@ -111,10 +163,10 @@ def synthesize_text_to_mp3(
     api_key=None,
     model=DEFAULT_MODEL,
     api_base_url=API_BASE_URL,
-    timeout=120,
+    timeout=DEFAULT_TIMEOUT_SECONDS,
 ):
     """Send one text chunk to Venice TTS and save the returned MP3 bytes."""
-    voice_id = normalize_voice(voice_id)
+    voice_id = normalize_voice(voice_id, model)
     api_key = get_venice_api_key(api_key)
     if not api_key:
         raise TextToSpeechError("VENICE_API_KEY is not set in the process environment or a local .env/venice.env file.")
@@ -122,20 +174,73 @@ def synthesize_text_to_mp3(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    response = requests.post(
-        f"{api_base_url.rstrip('/')}/audio/speech",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "input": text,
-            "voice": voice_id,
-        },
-        timeout=timeout,
+    url = f"{api_base_url.rstrip('/')}/audio/speech"
+    start_time = time.monotonic()
+    LOGGER.info(
+        "Starting Venice TTS request: model=%s voice=%s chars=%s timeout=%ss output=%s",
+        model,
+        voice_id,
+        len(text),
+        timeout,
+        output_path,
+    )
+
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "input": text,
+                "voice": voice_id,
+                "response_format": "mp3",
+                "speed": 1,
+                "streaming": False,
+            },
+            timeout=timeout,
+        )
+    except requests.Timeout as exc:
+        elapsed = time.monotonic() - start_time
+        LOGGER.exception(
+            "Venice TTS request timed out after %.1fs: model=%s voice=%s chars=%s timeout=%ss",
+            elapsed,
+            model,
+            voice_id,
+            len(text),
+            timeout,
+        )
+        raise TextToSpeechError(
+            f"Venice TTS request timed out after {timeout} seconds "
+            f"for a {len(text)} character chunk."
+        ) from exc
+    except requests.RequestException as exc:
+        elapsed = time.monotonic() - start_time
+        LOGGER.exception(
+            "Venice TTS request failed after %.1fs before receiving a response: model=%s voice=%s chars=%s",
+            elapsed,
+            model,
+            voice_id,
+            len(text),
+        )
+        raise TextToSpeechError(f"Venice TTS request failed: {exc}") from exc
+
+    elapsed = time.monotonic() - start_time
+    LOGGER.info(
+        "Finished Venice TTS request: status=%s elapsed=%.1fs bytes=%s",
+        response.status_code,
+        elapsed,
+        len(response.content),
     )
     if response.status_code != 200:
+        LOGGER.error(
+            "Venice TTS HTTP failure: status=%s elapsed=%.1fs body=%s",
+            response.status_code,
+            elapsed,
+            response.text[:1000],
+        )
         raise TextToSpeechError(
             f"Venice TTS request failed with HTTP {response.status_code}: {response.text}"
         )
@@ -150,8 +255,10 @@ def text_file_to_mp3(
     voice_id="default",
     *,
     api_key=None,
+    model=DEFAULT_MODEL,
     chunk_size=DEFAULT_CHUNK_SIZE,
     delay_seconds=DEFAULT_DELAY_SECONDS,
+    timeout=DEFAULT_TIMEOUT_SECONDS,
     progress_callback=None,
 ):
     """
@@ -160,7 +267,7 @@ def text_file_to_mp3(
     Long files are split into request-sized chunks. Returned MP3 chunks are
     appended into the output file in order.
     """
-    voice_id = normalize_voice(voice_id)
+    voice_id = normalize_voice(voice_id, model)
     text_file_path = Path(text_file_path)
     if not text_file_path.is_file():
         raise TextToSpeechError(f"Text file does not exist: {text_file_path}")
@@ -172,6 +279,17 @@ def text_file_to_mp3(
 
     output_path = Path(output_path) if output_path else text_file_path.with_suffix(".mp3")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    LOGGER.info(
+        "Starting TTS file conversion: input=%s output=%s model=%s voice=%s chars=%s chunks=%s chunk_size=%s delay=%ss",
+        text_file_path,
+        output_path,
+        model,
+        voice_id,
+        len(text),
+        len(chunks),
+        chunk_size,
+        delay_seconds,
+    )
 
     api_key = get_venice_api_key(api_key)
     if not api_key:
@@ -181,6 +299,13 @@ def text_file_to_mp3(
         for index, chunk in enumerate(chunks, start=1):
             if progress_callback:
                 progress_callback(index, len(chunks), f"Converting chunk {index} of {len(chunks)}")
+            LOGGER.info(
+                "Converting TTS chunk: input=%s chunk=%s/%s chars=%s",
+                text_file_path,
+                index,
+                len(chunks),
+                len(chunk),
+            )
 
             chunk_path = output_path.with_suffix(f".part{index:03d}.mp3")
             try:
@@ -189,6 +314,8 @@ def text_file_to_mp3(
                     chunk_path,
                     voice_id,
                     api_key=api_key,
+                    model=model,
+                    timeout=timeout,
                 )
                 output_file.write(chunk_path.read_bytes())
             finally:
@@ -199,12 +326,32 @@ def text_file_to_mp3(
 
     if progress_callback:
         progress_callback(len(chunks), len(chunks), "Conversion complete")
+    LOGGER.info("Completed TTS file conversion: output=%s chunks=%s", output_path, len(chunks))
     return output_path
 
 
-def normalize_voice(voice_id):
+def model_label(model):
+    """Return a human-readable TTS model label."""
+    return TTS_MODEL_LABELS.get(model, model)
+
+
+def voices_for_model(model):
+    """Return known voice choices for a TTS model."""
+    return VOICES_BY_MODEL.get(model, VALID_VOICES)
+
+
+def default_voice_for_model(model):
+    """Return the default voice choice for a TTS model."""
+    return DEFAULT_VOICE_BY_MODEL.get(model, "default")
+
+
+def normalize_voice(voice_id, model=DEFAULT_MODEL):
     """Return a supported Venice voice name."""
-    voice_id = (voice_id or "default").strip().lower()
+    voice_id = (voice_id or "").strip() or default_voice_for_model(model)
+    if model == ELEVENLABS_TURBO_MODEL:
+        return voice_id
+
+    voice_id = voice_id.lower()
     if voice_id in VENICE_VOICE_ALIASES:
         return VENICE_VOICE_ALIASES[voice_id]
     if voice_id in VENICE_VOICE_ALIASES.values():

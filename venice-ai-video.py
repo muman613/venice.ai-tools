@@ -75,7 +75,6 @@ DEFAULT_TEXT_VIDEO_MODEL = os.environ.get(
     "VENICE_TEXT_VIDEO_MODEL",
     "wan-2.5-preview-text-to-video",
 ).strip()
-MAX_SEGMENT_SECONDS = 15
 VIDEO_RESOLUTION = "1080p"
 VIDEO_ASPECT_RATIO = "16:9"
 
@@ -89,6 +88,15 @@ PREFERRED_VIDEO_MODEL_IDS = {
 
 HTTP_TIMEOUT = (30, 180)
 DOWNLOAD_TIMEOUT = (30, 600)
+FFMPEG_FRAME_TIMEOUT_SECONDS = int(
+    os.environ.get("VENICE_FFMPEG_FRAME_TIMEOUT", "120")
+)
+FFMPEG_STITCH_TIMEOUT_SECONDS = int(
+    os.environ.get("VENICE_FFMPEG_STITCH_TIMEOUT", "900")
+)
+SEEDANCE_CONSENT_TIMEOUT_SECONDS = int(
+    os.environ.get("VENICE_SEEDANCE_CONSENT_TIMEOUT", "900")
+)
 
 VIDEO_JOB_TIMEOUT_SECONDS = int(
     os.environ.get("VENICE_VIDEO_TIMEOUT", "1800")
@@ -339,6 +347,9 @@ def reference_image_limit(model):
     ):
         return 0
 
+    if "seedance-2-5" in model_id:
+        return 30
+
     if "seedance" in model_id:
         return 9
 
@@ -453,26 +464,93 @@ def extract_video_models(data, generation_mode):
         )
     )
 
-    preferred_options = [
-        option
+    preferred_count = sum(
+        1
         for option in options
         if option.uncensored or option.preferred
-    ]
+    )
 
-    if preferred_options:
+    if preferred_count:
         return (
-            preferred_options,
-            f"Loaded uncensored/preferred {mode_label} models.",
+            options,
+            (
+                f"Loaded {len(options)} {mode_label} models "
+                f"({preferred_count} uncensored/preferred first)."
+            ),
         )
 
     return (
         options,
-        (
-            "No models were explicitly marked uncensored; "
-            f"showing {mode_label} models."
-        ),
+        f"Loaded {len(options)} {mode_label} models.",
     )
 
+
+def fallback_video_durations(model_id):
+    """Return conservative durations for a manually entered model ID."""
+    model_id_lower = model_id.lower()
+
+    if "seedance-2-5" in model_id_lower:
+        return tuple(
+            f"{seconds}s"
+            for seconds in range(30, 3, -1)
+        )
+
+    if "seedance" in model_id_lower:
+        return tuple(
+            f"{seconds}s"
+            for seconds in range(15, 3, -1)
+        )
+
+    return ("15s", "10s", "5s")
+
+
+def fallback_video_resolutions(model_id):
+    """Return conservative resolutions for a manually entered model ID."""
+    model_id_lower = model_id.lower()
+
+    if "seedance-2-5" in model_id_lower:
+        return ("720p", "480p")
+
+    if "seedance" in model_id_lower:
+        return ("1080p", "720p", "480p")
+
+    return (VIDEO_RESOLUTION, "720p")
+
+
+def fallback_reference_image_limit(model_id):
+    """Return a flat-reference-image limit for a manual model option."""
+    model_id_lower = model_id.lower()
+
+    if (
+        "reference-to-video" not in model_id_lower
+        and "r2v" not in model_id_lower
+    ):
+        return 0
+
+    if "seedance-2-5" in model_id_lower:
+        return 30
+
+    if "seedance" in model_id_lower:
+        return 9
+
+    return 7
+
+
+def fallback_video_aspect_ratios(model_id):
+    """Return conservative aspect ratios for a manually entered model ID."""
+    model_id_lower = model_id.lower()
+
+    if "seedance" in model_id_lower:
+        return (
+            "16:9",
+            "9:16",
+            "1:1",
+            "4:3",
+            "3:4",
+            "21:9",
+        )
+
+    return (VIDEO_ASPECT_RATIO,)
 
 # ---------------------------------------------------------------------------
 # Background worker
@@ -1104,7 +1182,13 @@ class VeniceVideoWorker(QObject):
             info["roles_text"],
             info["docs_url"],
         )
-        self.seedance_consent_event.wait()
+        if not self.seedance_consent_event.wait(
+            SEEDANCE_CONSENT_TIMEOUT_SECONDS
+        ):
+            raise RuntimeError(
+                "Timed out waiting for Seedance consent confirmation."
+            )
+
         return self.seedance_consent_accepted
 
     @staticmethod
@@ -1188,14 +1272,75 @@ class VeniceVideoWorker(QObject):
                 "assetUrl",
                 "result_url",
                 "resultUrl",
+                "media_url",
+                "mediaUrl",
+                "url",
             },
         )
 
         return str(value) if value else None
 
+    @staticmethod
+    def describe_video_timing(average_execution_time, execution_duration):
+        """Return a compact elapsed/estimated processing-time summary."""
+        values = []
+
+        for label, value in (
+            ("elapsed", execution_duration),
+            ("p80", average_execution_time),
+        ):
+            try:
+                milliseconds = float(value)
+            except (TypeError, ValueError):
+                continue
+
+            if milliseconds <= 0:
+                continue
+
+            values.append(
+                f"{label} {milliseconds / 1000:.0f}s"
+            )
+
+        return ", ".join(values)
+
     # ------------------------------------------------------------------
     # Story segmentation
     # ------------------------------------------------------------------
+
+    def segmentation_system_prompt(self):
+        """Return the system prompt used to split video segments."""
+        return (
+            "You are an expert video generation prompt engineer "
+            "specializing in temporal consistency. Your task is to break "
+            "the provided story into a JSON array of sequential video "
+            f"segments. Use the '{self.video_model}' model for best "
+            "results. Return ONLY valid JSON without Markdown, code "
+            "blocks, or commentary.\n\n"
+            "CRITICAL RULES FOR CONTINUITY:\n"
+            "1. MEMORY: The video model does not have memory. You must "
+            "manually bridge the gap between segments.\n"
+            "2. VISUAL RECAP: For every segment index > 1, the "
+            "'description' field MUST begin with a summary of the "
+            "previous segment's visual state (positions, clothing, "
+            "camera angle, props).\n"
+            "3. ANCHORING: The 'first_frame_continuity' field must "
+            "EXACTLY match the 'final_frame' of the previous segment to "
+            "force the model to start from that moment.\n\n"
+            "JSON Structure:\n"
+            "{\n"
+            "  'segment': 1,\n"
+            f"  'mode': '{self.generation_mode}',\n"
+            f"  'model': '{self.video_model}',\n"
+            "  'duration': '<segment duration, for example 15s>',\n"
+            "  'description': 'Visual recap of previous state + current "
+            "action',\n"
+            "  'first_frame_continuity': 'Exact match of previous "
+            "final_frame',\n"
+            "  'motion_continuation': 'Specific movements',\n"
+            "  'final_frame': 'The specific ending image you want',\n"
+            "  'transition_note': 'Internal note for context'\n"
+            "}"
+        )
 
     def segment_story(self):
         """Split the video concept into timed segment prompts."""
@@ -1204,11 +1349,7 @@ class VeniceVideoWorker(QObject):
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You create precise prompts for sequential "
-                        f"{self.generation_mode} generation. Return only valid JSON "
-                        "without Markdown or commentary."
-                    ),
+                    "content": self.segmentation_system_prompt(),
                 },
                 {
                     "role": "user",
@@ -1574,6 +1715,7 @@ Original video concept:
         commands = [
             [
                 ffmpeg_path,
+                "-nostdin",
                 "-y",
                 "-sseof",
                 "-0.50",
@@ -1589,6 +1731,7 @@ Original video concept:
             ],
             [
                 ffmpeg_path,
+                "-nostdin",
                 "-y",
                 "-i",
                 str(video_path),
@@ -1607,12 +1750,20 @@ Original video concept:
         for command in commands:
             output_path.unlink(missing_ok=True)
 
-            result = subprocess.run(
-                command,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            try:
+                result = subprocess.run(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=FFMPEG_FRAME_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                errors.append(
+                    "FFmpeg timed out while extracting a frame."
+                )
+                continue
 
             if (
                 result.returncode == 0
@@ -1803,9 +1954,10 @@ Original video concept:
             )
 
         queue_id = self.get_queue_id(queue_data)
-        queued_model = str(
-            queue_data.get("model") or self.video_model
-        )
+        # The retrieve endpoint requires the model ID used to queue the
+        # generation. Some queue responses include nested or provider-facing
+        # model values, so keep the submitted Venice model ID.
+        queued_model = self.video_model
         queued_download_url = self.get_download_url(
             queue_data
         )
@@ -1863,6 +2015,7 @@ Original video concept:
         transient_failures = 0
         retrieve_http_500_failures = 0
         completed_without_url = 0
+        last_status_progress_time = 0
 
         while time.monotonic() < deadline:
             try:
@@ -2004,16 +2157,45 @@ Original video concept:
 
             status = self.get_status(data)
 
-            if status != last_status:
+            average_execution_time = self.find_first_value(
+                data,
+                {
+                    "average_execution_time",
+                    "averageExecutionTime",
+                },
+            )
+            execution_duration = self.find_first_value(
+                data,
+                {
+                    "execution_duration",
+                    "executionDuration",
+                },
+            )
+
+            timing = self.describe_video_timing(
+                average_execution_time,
+                execution_duration,
+            )
+            now = time.monotonic()
+
+            if (
+                status != last_status
+                or now - last_status_progress_time >= 60
+            ):
+                message = (
+                    f"Segment {segment.number}: "
+                    f"status {status}, queue {queue_id}"
+                )
+                if timing:
+                    message += f" ({timing})"
+
                 self.progress.emit(
                     segment.number - 1,
-                    (
-                        f"Segment {segment.number}: "
-                        f"status {status}, queue {queue_id}"
-                    ),
+                    message,
                 )
 
                 last_status = status
+                last_status_progress_time = now
 
             if status in FAILED_STATUSES:
                 error_value = self.find_first_value(
@@ -2248,6 +2430,7 @@ Original video concept:
             # original embedded video and audio streams.
             copy_command = [
                 ffmpeg_path,
+                "-nostdin",
                 "-y",
                 "-f",
                 "concat",
@@ -2262,12 +2445,20 @@ Original video concept:
                 str(final_path),
             ]
 
-            copy_result = subprocess.run(
-                copy_command,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            try:
+                copy_result = subprocess.run(
+                    copy_command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=FFMPEG_STITCH_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    "FFmpeg timed out while stream-copy stitching "
+                    "the generated segments."
+                ) from exc
 
             if (
                 copy_result.returncode == 0
@@ -2282,6 +2473,7 @@ Original video concept:
             # preserve/re-encode an optional embedded audio stream.
             reencode_command = [
                 ffmpeg_path,
+                "-nostdin",
                 "-y",
                 "-f",
                 "concat",
@@ -2312,12 +2504,20 @@ Original video concept:
                 str(final_path),
             ]
 
-            reencode_result = subprocess.run(
-                reencode_command,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            try:
+                reencode_result = subprocess.run(
+                    reencode_command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=FFMPEG_STITCH_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    "FFmpeg timed out while re-encoding and stitching "
+                    "the generated segments."
+                ) from exc
 
             if reencode_result.returncode != 0:
                 raise RuntimeError(
@@ -3019,6 +3219,9 @@ class VideoWindow(QMainWindow):
             default_model,
             default_model,
         )
+        if self.selected_generation_mode() == TEXT_TO_VIDEO_MODE:
+            self.source_file_edit.clear()
+            self.clear_reference_files()
         self.update_source_controls()
         self.load_video_models()
 
@@ -3214,41 +3417,14 @@ class VideoWindow(QMainWindow):
             model_id = self.default_video_model()
 
         model_id_lower = model_id.lower()
-        max_reference_images = (
-            7
-            if (
-                "reference-to-video" in model_id_lower
-                or "r2v" in model_id_lower
-            )
-            else 0
-        )
-        if "seedance" in model_id_lower:
-            max_reference_images = 9
-            durations = (
-                "10s",
-                "9s",
-                "8s",
-                "7s",
-                "6s",
-                "5s",
-                "4s",
-                "3s",
-                "2s",
-                "1s",
-            )
-            resolutions = ("1080p", "720p")
-        else:
-            durations = ("15s", "10s", "5s")
-            resolutions = (VIDEO_RESOLUTION, "720p")
-
         return VideoModelOption(
             model_id=model_id,
             label=model_id,
             preferred=is_preferred_video_model_id(model_id_lower),
-            durations=durations,
-            resolutions=resolutions,
-            aspect_ratios=(VIDEO_ASPECT_RATIO,),
-            max_reference_images=max_reference_images,
+            durations=fallback_video_durations(model_id),
+            resolutions=fallback_video_resolutions(model_id),
+            aspect_ratios=fallback_video_aspect_ratios(model_id),
+            max_reference_images=fallback_reference_image_limit(model_id),
         )
 
     def selected_video_model(self):
@@ -3278,16 +3454,18 @@ class VideoWindow(QMainWindow):
             .strip()
         )
 
-        source_file = (
-            self.source_file_edit
-            .text()
-            .strip()
-        )
-
         generation_mode = self.selected_generation_mode()
         video_option = self.selected_video_option()
         video_model = video_option.model_id
-        reference_files = list(self.reference_files)
+        source_file = ""
+        reference_files = []
+        if generation_mode == IMAGE_TO_VIDEO_MODE:
+            source_file = (
+                self.source_file_edit
+                .text()
+                .strip()
+            )
+            reference_files = list(self.reference_files)
         total_seconds = self.output_seconds_spin.value()
         try:
             segment_durations = (
@@ -3366,7 +3544,11 @@ class VideoWindow(QMainWindow):
             )
             return
 
-        if source_file and not Path(source_file).is_file():
+        if (
+            generation_mode == IMAGE_TO_VIDEO_MODE
+            and source_file
+            and not Path(source_file).is_file()
+        ):
             QMessageBox.warning(
                 self,
                 "Invalid starting image",
