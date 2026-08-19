@@ -3,6 +3,7 @@
 
 import base64
 import json
+import subprocess
 import struct
 import sys
 import zlib
@@ -12,7 +13,7 @@ from pathlib import Path
 
 import requests
 from PySide6.QtCore import QObject, QSettings, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QPixmap
+from PySide6.QtGui import QAction, QDesktopServices, QImageReader, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -52,6 +53,14 @@ SETTINGS_APP = "ImageGeneration"
 OUTPUT_DIR_SETTING = "paths/output_dir"
 PROMPT_DIR_SETTING = "paths/prompt_dir"
 GENERATION_LOG_FILENAME = "venice-image-gen.log"
+FORM_SETTINGS_GROUP = "generation_form"
+WINDOW_GEOMETRY_SETTING = "window/geometry"
+WINDOW_STATE_SETTING = "window/state"
+WINDOW_MAXIMIZED_SETTING = "window/maximized"
+
+VIDEO_EXTENSIONS = {
+    ".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm",
+}
 
 SIZING_WIDTH_HEIGHT = "width_height"
 SIZING_ASPECT_RATIO = "aspect_ratio"
@@ -221,6 +230,125 @@ def add_png_description(image_bytes, description):
         offset = chunk_end
 
     return image_bytes
+
+
+def embedded_file_metadata(filename):
+    """Return human-readable embedded metadata for an image or video file."""
+    path = Path(filename)
+    if not path.is_file():
+        return ""
+
+    if path.suffix.lower() in VIDEO_EXTENSIONS:
+        return embedded_video_metadata(path)
+
+    metadata = png_text_metadata(path) if path.suffix.lower() == ".png" else {}
+    reader = QImageReader(str(path))
+    for key in reader.textKeys():
+        value = reader.text(key)
+        if value:
+            metadata[str(key)] = value
+    return json.dumps(metadata, indent=2, ensure_ascii=False) if metadata else ""
+
+
+def png_text_metadata(path):
+    """Read PNG tEXt, zTXt, and iTXt fields without image-plugin limitations."""
+    try:
+        image_bytes = path.read_bytes()
+    except OSError:
+        return {}
+    if not image_bytes.startswith(PNG_SIGNATURE):
+        return {}
+
+    metadata = {}
+    offset = len(PNG_SIGNATURE)
+    while offset + 12 <= len(image_bytes):
+        length = struct.unpack(">I", image_bytes[offset:offset + 4])[0]
+        chunk_type = image_bytes[offset + 4:offset + 8]
+        payload_start = offset + 8
+        chunk_end = payload_start + length
+        if chunk_end + 4 > len(image_bytes):
+            break
+        payload = image_bytes[payload_start:chunk_end]
+
+        try:
+            keyword_bytes, separator, remainder = payload.partition(b"\x00")
+            if not separator:
+                raise ValueError
+            keyword = keyword_bytes.decode("latin-1")
+            if chunk_type == b"tEXt":
+                value = remainder.decode("latin-1")
+            elif chunk_type == b"zTXt" and len(remainder) >= 2:
+                value = zlib.decompress(remainder[1:]).decode("latin-1")
+            elif chunk_type == b"iTXt" and len(remainder) >= 2:
+                compressed = remainder[0] == 1
+                text_fields = remainder[2:]
+                _, separator, text_fields = text_fields.partition(b"\x00")
+                if not separator:
+                    raise ValueError
+                _, separator, text_bytes = text_fields.partition(b"\x00")
+                if not separator:
+                    raise ValueError
+                if compressed:
+                    text_bytes = zlib.decompress(text_bytes)
+                value = text_bytes.decode("utf-8")
+            else:
+                value = ""
+            if value:
+                metadata[keyword] = value
+        except (UnicodeDecodeError, ValueError, zlib.error):
+            pass
+
+        offset = chunk_end + 4
+        if chunk_type == b"IEND":
+            break
+
+    return metadata
+
+
+def embedded_video_metadata(path):
+    """Return container and stream tags reported by ffprobe."""
+    try:
+        result = subprocess.run(
+            (
+                "ffprobe", "-v", "error", "-show_entries",
+                "format_tags:stream=index,codec_type:stream_tags",
+                "-of", "json", str(path),
+            ),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+    if result.returncode != 0:
+        return ""
+    try:
+        probe = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return ""
+
+    metadata = {}
+    format_tags = probe.get("format", {}).get("tags", {})
+    if format_tags:
+        metadata["container"] = format_tags
+
+    stream_tags = []
+    for stream in probe.get("streams", []):
+        tags = stream.get("tags", {})
+        if tags:
+            stream_tags.append(
+                {
+                    "index": stream.get("index"),
+                    "type": stream.get("codec_type"),
+                    "tags": tags,
+                }
+            )
+    if stream_tags:
+        metadata["streams"] = stream_tags
+
+    return json.dumps(metadata, indent=2, ensure_ascii=False) if metadata else ""
 
 
 def usd_amount(value):
@@ -596,11 +724,20 @@ class ImageGenerationWindow(QMainWindow):
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumSize(320, 240)
 
+        self.metadata_label = QLabel("Embedded metadata")
+        self.metadata_edit = QTextEdit()
+        self.metadata_edit.setReadOnly(True)
+        self.metadata_edit.setMaximumHeight(150)
+        self.metadata_label.hide()
+        self.metadata_edit.hide()
+
         self.output_list = QListWidget()
         self.output_list.currentRowChanged.connect(self.preview_selected_image)
+        self.output_list.itemDoubleClicked.connect(self.open_output_item)
 
         self.build_layout()
         self.apply_style()
+        self.restore_settings()
         self.update_sizing_controls()
         self.update_description_controls()
         self.update_cost_estimate()
@@ -730,6 +867,8 @@ class ImageGenerationWindow(QMainWindow):
 
         right_layout = QVBoxLayout()
         right_layout.addWidget(self.preview_label, 1)
+        right_layout.addWidget(self.metadata_label)
+        right_layout.addWidget(self.metadata_edit)
         right_layout.addWidget(QLabel("Generated files"))
         right_layout.addWidget(self.output_list)
 
@@ -914,6 +1053,10 @@ class ImageGenerationWindow(QMainWindow):
         self.style_combo.addItem("None", "")
         for style in styles:
             self.style_combo.addItem(style, style)
+        saved_style = self.settings.value(f"{FORM_SETTINGS_GROUP}/style", "", str)
+        style_index = self.style_combo.findData(saved_style)
+        if style_index >= 0:
+            self.style_combo.setCurrentIndex(style_index)
 
         self.refresh_button.setEnabled(True)
         self.status_label.setText(f"Loaded {self.model_combo.count()} image models and {len(styles)} styles.")
@@ -1256,10 +1399,23 @@ class ImageGenerationWindow(QMainWindow):
         item = self.output_list.currentItem()
         if not item:
             self.preview_label.setText("Generated image preview")
+            self.show_metadata("")
             self.open_output_button.setEnabled(False)
             return
 
-        self.display_image(item.text())
+        path = item.text()
+        previewed = self.display_image(path)
+        if not previewed and Path(path).suffix.lower() in VIDEO_EXTENSIONS:
+            self.preview_label.setText(f"Video selected:\n{path}")
+            self.open_output_button.setEnabled(Path(path).is_file())
+        self.show_metadata(embedded_file_metadata(path))
+
+    def show_metadata(self, metadata):
+        """Show the embedded-metadata field only when metadata is present."""
+        self.metadata_edit.setPlainText(metadata)
+        visible = bool(metadata)
+        self.metadata_label.setVisible(visible)
+        self.metadata_edit.setVisible(visible)
 
     def display_image(self, image_path):
         """Load an image path into the preview."""
@@ -1283,11 +1439,119 @@ class ImageGenerationWindow(QMainWindow):
         item = self.output_list.currentItem()
         if not item:
             return
+        self.open_output_item(item)
+
+    def open_output_item(self, item, *_args):
+        """Open a generated file with its operating-system default viewer."""
         path = Path(item.text())
         if not path.is_file():
-            QMessageBox.warning(self, "Missing image", f"The selected image does not exist:\n{path}")
+            QMessageBox.warning(self, "Missing file", f"The selected file does not exist:\n{path}")
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve()))):
+            QMessageBox.warning(self, "Open failed", f"Could not open the selected file:\n{path}")
+
+    def restore_settings(self):
+        """Restore generation controls saved by the previous session."""
+        settings = self.settings
+        group = FORM_SETTINGS_GROUP
+
+        text_controls = {
+            "model": self.model_combo,
+            "prompt": self.prompt_edit,
+            "negative_prompt": self.negative_prompt_edit,
+            "description": self.description_edit,
+            "filename_prefix": self.filename_prefix_edit,
+        }
+        for name, control in text_controls.items():
+            value = settings.value(f"{group}/{name}", None)
+            if value is None:
+                continue
+            if isinstance(control, QTextEdit):
+                control.setPlainText(str(value))
+            elif isinstance(control, QComboBox):
+                control.setCurrentText(str(value))
+            else:
+                control.setText(str(value))
+
+        combo_controls = {
+            "sizing_mode": self.sizing_mode_combo,
+            "aspect_ratio": self.aspect_ratio_combo,
+            "resolution": self.resolution_combo,
+            "format": self.format_combo,
+            "quality": self.quality_combo,
+        }
+        for name, control in combo_controls.items():
+            value = settings.value(f"{group}/{name}", None)
+            if value is None:
+                continue
+            index = control.findData(value) if name == "sizing_mode" else control.findText(str(value))
+            if index >= 0:
+                control.setCurrentIndex(index)
+
+        spin_controls = {
+            "width": self.width_spin,
+            "height": self.height_spin,
+            "variants": self.variants_spin,
+            "steps": self.steps_spin,
+            "cfg": self.cfg_spin,
+            "seed": self.seed_spin,
+        }
+        for name, control in spin_controls.items():
+            value = settings.value(f"{group}/{name}", None)
+            if value is not None:
+                control.setValue(int(value))
+
+        check_controls = {
+            "use_description": self.description_check,
+            "safe_mode": self.safe_mode_check,
+            "hide_watermark": self.hide_watermark_check,
+            "enhance_prompt": self.enhance_prompt_check,
+            "embed_exif": self.embed_exif_check,
+        }
+        for name, control in check_controls.items():
+            control.setChecked(settings.value(f"{group}/{name}", control.isChecked(), bool))
+
+        geometry = settings.value(WINDOW_GEOMETRY_SETTING)
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        state = settings.value(WINDOW_STATE_SETTING)
+        if state is not None:
+            self.restoreState(state)
+
+    def save_settings(self):
+        """Persist generation controls and window state."""
+        settings = self.settings
+        group = FORM_SETTINGS_GROUP
+        values = {
+            "model": self.selected_model(),
+            "style": self.style_combo.currentData() or "",
+            "prompt": self.prompt_edit.toPlainText(),
+            "negative_prompt": self.negative_prompt_edit.toPlainText(),
+            "description": self.description_edit.toPlainText(),
+            "filename_prefix": self.filename_prefix_edit.text(),
+            "sizing_mode": self.sizing_mode_combo.currentData(),
+            "width": self.width_spin.value(),
+            "height": self.height_spin.value(),
+            "aspect_ratio": self.aspect_ratio_combo.currentText(),
+            "resolution": self.resolution_combo.currentText(),
+            "format": self.format_combo.currentText(),
+            "quality": self.quality_combo.currentText(),
+            "variants": self.variants_spin.value(),
+            "steps": self.steps_spin.value(),
+            "cfg": self.cfg_spin.value(),
+            "seed": self.seed_spin.value(),
+            "use_description": self.description_check.isChecked(),
+            "safe_mode": self.safe_mode_check.isChecked(),
+            "hide_watermark": self.hide_watermark_check.isChecked(),
+            "enhance_prompt": self.enhance_prompt_check.isChecked(),
+            "embed_exif": self.embed_exif_check.isChecked(),
+        }
+        for name, value in values.items():
+            settings.setValue(f"{group}/{name}", value)
+        settings.setValue(WINDOW_GEOMETRY_SETTING, self.saveGeometry())
+        settings.setValue(WINDOW_STATE_SETTING, self.saveState())
+        settings.setValue(WINDOW_MAXIMIZED_SETTING, self.isMaximized())
+        settings.sync()
 
     def set_generating(self, generating):
         """Enable or disable controls while generation is running."""
@@ -1313,6 +1577,7 @@ class ImageGenerationWindow(QMainWindow):
             )
             event.ignore()
             return
+        self.save_settings()
         super().closeEvent(event)
 
 
@@ -1320,7 +1585,10 @@ def main():
     """Run the Venice AI image-generation GUI."""
     app = QApplication(sys.argv)
     window = ImageGenerationWindow()
-    window.showMaximized()
+    if window.settings.value(WINDOW_MAXIMIZED_SETTING, True, bool):
+        window.showMaximized()
+    else:
+        window.show()
     return app.exec()
 
 
