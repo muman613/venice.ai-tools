@@ -63,6 +63,9 @@ python venice-ai-story-writer.py
 `venice-ai-story-writer.py` is a desktop writing assistant for Venice chat models.
 
 - Enter or edit your prompt in the `Request` text area.
+- Choose a genre to add its instructions to the system prompt. Use `Edit Genres` to add,
+  modify, or delete genre prompts; they are persisted in a JSON file beside the app's
+  platform settings file.
 - Click `Send`, or press `Ctrl+Enter`, to generate a response.
 - The previous visible response is cleared when a new request is sent.
 - The prompt remains in the `Request` area after generation so you can revise it and send again.
@@ -71,8 +74,13 @@ python venice-ai-story-writer.py
 - `Save Story` exports the latest generated response as TXT, Markdown, or HTML.
 - `Export Chat` exports prompts and responses together as Markdown.
 - `Export HTML` exports the latest rendered response as HTML.
+- Save and export dialogs remember the last successfully used directory across restarts.
 
 The `Max tokens` control limits how much text Venice can return. If a response stops because it reached that limit, the status bar reports that explicitly. Increase `Max tokens` or ask the model to continue when that happens.
+
+The story writer estimates the next request's maximum USD cost from Venice's live model
+pricing. Input tokens are approximated locally, while output cost uses the selected maximum
+token limit; the actual charge can be lower when a response finishes early.
 
 Run the image generator:
 

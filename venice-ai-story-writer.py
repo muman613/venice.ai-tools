@@ -3,6 +3,7 @@
 
 import html
 import json
+import math
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,16 +11,19 @@ from pathlib import Path
 
 import markdown
 import requests
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, Signal
 from PySide6.QtGui import QKeySequence, QShortcut, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -38,12 +42,30 @@ API_URL = "https://api.venice.ai/api/v1/chat/completions"
 MODELS_URL = "https://api.venice.ai/api/v1/models"
 DEFAULT_MODEL = "venice-uncensored-1-2"
 SYSTEM_PROMPT = (
-    "You are a erotic fetish story writing assistant. Help write engaging stories with "
+    "Help write engaging stories with "
     "vivid descriptions, strong continuity, and compelling narrative momentum.\n\n"
     "Always return a well-formed Markdown document fragment. Use Markdown headings, "
     "paragraphs, emphasis, block quotes, lists, and horizontal rules when they help "
     "the document. Put a blank line between paragraphs. Do not wrap the response in "
     "a fenced code block unless the user specifically asks for code."
+)
+SETTINGS_ORG = "VeniceAI"
+SETTINGS_APP = "StoryWriter"
+SELECTED_GENRE_SETTING = "story/selected_genre"
+SAVE_DIRECTORY_SETTING = "paths/save_directory"
+GENRES_FILENAME = "venice-ai-story-writer-genres.json"
+DEFAULT_GENRES = (
+    {
+        "name": "General",
+        "prompt": (
+            "Write an engaging story that follows the user's requested subject, tone, "
+            "setting, and audience."
+        ),
+    },
+    {
+        "name": "Erotic fetish",
+        "prompt": "Write as an erotic fetish story-writing assistant.",
+    },
 )
 MARKDOWN_EXTENSIONS = (
     "extra",
@@ -68,6 +90,7 @@ class ChatModelOption:
     model_id: str
     label: str
     context_length: int = 0
+    pricing: object = None
 
 
 def model_text(model):
@@ -119,6 +142,16 @@ def model_context_length(model):
     return int(model.get("context_length") or spec_context or 0)
 
 
+def model_pricing(model):
+    """Return token pricing metadata from a Venice model object."""
+    if not isinstance(model, dict):
+        return None
+    model_spec = model.get("model_spec")
+    if isinstance(model_spec, dict) and model_spec.get("pricing"):
+        return model_spec["pricing"]
+    return model.get("pricing")
+
+
 def is_uncensored_chat_model(model):
     """Return True when model metadata advertises uncensored text chat behavior."""
     if not isinstance(model, dict):
@@ -137,7 +170,7 @@ def chat_model_option(model):
     label = model_id if not name or name == model_id else f"{name} ({model_id})"
     if context_length:
         label = f"{label} - {context_length:,} ctx"
-    return ChatModelOption(model_id, label, context_length)
+    return ChatModelOption(model_id, label, context_length, model_pricing(model))
 
 
 def extract_uncensored_chat_models(data):
@@ -160,19 +193,291 @@ class ChatEntry:
     response: str
 
 
+def normalize_genres(data):
+    """Validate and normalize genre data loaded from JSON."""
+    genres = data.get("genres") if isinstance(data, dict) else data
+    if not isinstance(genres, list):
+        raise ValueError("The genre file must contain a 'genres' list.")
+
+    normalized = []
+    names = set()
+    for index, genre in enumerate(genres, start=1):
+        if not isinstance(genre, dict):
+            raise ValueError(f"Genre {index} must be a JSON object.")
+        name = str(genre.get("name", "")).strip()
+        prompt = str(genre.get("prompt", "")).strip()
+        if not name or not prompt:
+            raise ValueError(f"Genre {index} must have a non-empty name and prompt.")
+        name_key = name.casefold()
+        if name_key in names:
+            raise ValueError(f"Duplicate genre name: {name}")
+        names.add(name_key)
+        normalized.append({"name": name, "prompt": prompt})
+    return normalized
+
+
+def load_genres(path):
+    """Load genres from disk, creating the default file on first use."""
+    path = Path(path)
+    if not path.exists():
+        genres = [dict(genre) for genre in DEFAULT_GENRES]
+        save_genres(path, genres)
+        return genres
+    return normalize_genres(json.loads(path.read_text(encoding="utf-8")))
+
+
+def save_genres(path, genres):
+    """Validate and save genres as readable JSON."""
+    path = Path(path)
+    normalized = normalize_genres(genres)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"genres": normalized}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def build_system_prompt(genre):
+    """Append the selected genre instructions to the stock system prompt."""
+    name = str(genre.get("name", "")).strip()
+    prompt = str(genre.get("prompt", "")).strip()
+    if not name or not prompt:
+        return SYSTEM_PROMPT
+    return f"{SYSTEM_PROMPT}\n\n## Genre: {name}\n\n{prompt}"
+
+
+def build_chat_messages(system_prompt, history, prompt):
+    """Return the messages included in a story-generation request."""
+    messages = [{"role": "system", "content": system_prompt}]
+    for entry in history:
+        messages.append({"role": "user", "content": entry.prompt})
+        messages.append({"role": "assistant", "content": entry.response})
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
+def estimate_message_tokens(messages):
+    """Estimate chat input tokens without requiring a model-specific tokenizer."""
+    token_count = 2
+    for message in messages:
+        content = str(message.get("content", ""))
+        token_count += 4 + math.ceil(len(content.encode("utf-8")) / 4)
+    return token_count
+
+
+def usd_amount(value):
+    """Return a USD float from Venice pricing metadata."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip().lstrip("$"))
+        except ValueError:
+            return None
+    if isinstance(value, dict):
+        for key in ("usd", "USD", "amount", "price", "cost"):
+            amount = usd_amount(value.get(key))
+            if amount is not None:
+                return amount
+    return None
+
+
+def text_token_prices(pricing):
+    """Return input and output USD prices per million tokens."""
+    if not isinstance(pricing, dict):
+        return None, None
+    return usd_amount(pricing.get("input")), usd_amount(pricing.get("output"))
+
+
+def text_generation_cost(pricing, input_tokens, max_output_tokens):
+    """Estimate input cost and maximum completion cost in USD."""
+    input_price, output_price = text_token_prices(pricing)
+    if input_price is None or output_price is None:
+        return {
+            "available": False,
+            "display": "unavailable (refresh models to load pricing)",
+        }
+
+    input_cost = input_tokens * input_price / 1_000_000
+    output_cost = max_output_tokens * output_price / 1_000_000
+    total = input_cost + output_cost
+    return {
+        "available": True,
+        "input_tokens": input_tokens,
+        "max_output_tokens": max_output_tokens,
+        "input_price": input_price,
+        "output_price": output_price,
+        "input_cost": input_cost,
+        "max_output_cost": output_cost,
+        "total": total,
+        "display": (
+            f"≈${total:.4f} maximum (≈{input_tokens:,} input + up to "
+            f"{max_output_tokens:,} output tokens; ${input_price:g}/${output_price:g} per 1M)"
+        ),
+    }
+
+
+class GenreEditorDialog(QDialog):
+    """Create, update, and delete persisted story genres."""
+
+    genres_changed = Signal(object)
+
+    def __init__(self, genres, genres_path, parent=None):
+        super().__init__(parent)
+        self.genres = [dict(genre) for genre in genres]
+        self.genres_path = Path(genres_path)
+        self.editing_index = None
+
+        self.setWindowTitle("Genre Editor")
+        self.resize(700, 440)
+
+        self.genre_list = QListWidget()
+        self.genre_list.currentRowChanged.connect(self.genre_selected)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Genre name")
+        self.prompt_edit = QTextEdit()
+        self.prompt_edit.setAcceptRichText(False)
+        self.prompt_edit.setPlaceholderText("Instructions added to the system prompt for this genre...")
+
+        self.new_button = QPushButton("New")
+        self.new_button.clicked.connect(self.new_genre)
+        self.save_button = QPushButton("Save")
+        self.save_button.clicked.connect(self.save_genre)
+        self.delete_button = QPushButton("Delete")
+        self.delete_button.clicked.connect(self.delete_genre)
+
+        editor_form = QFormLayout()
+        editor_form.addRow("Name", self.name_edit)
+        editor_form.addRow("Prompt", self.prompt_edit)
+        editor_panel = QWidget()
+        editor_panel.setLayout(editor_form)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self.genre_list)
+        splitter.addWidget(editor_panel)
+        splitter.setSizes([210, 470])
+
+        actions = QHBoxLayout()
+        actions.addWidget(self.new_button)
+        actions.addWidget(self.save_button)
+        actions.addWidget(self.delete_button)
+        actions.addStretch(1)
+        close_buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        close_buttons.rejected.connect(self.reject)
+        actions.addWidget(close_buttons)
+
+        layout = QVBoxLayout()
+        layout.addWidget(splitter, 1)
+        layout.addLayout(actions)
+        self.setLayout(layout)
+
+        self.refresh_list()
+        if self.genres:
+            self.genre_list.setCurrentRow(0)
+
+    def refresh_list(self, selected_index=None):
+        """Rebuild the genre list and optionally restore its selection."""
+        self.genre_list.blockSignals(True)
+        self.genre_list.clear()
+        self.genre_list.addItems(genre["name"] for genre in self.genres)
+        self.genre_list.blockSignals(False)
+        if selected_index is not None and self.genres:
+            self.genre_list.setCurrentRow(min(selected_index, len(self.genres) - 1))
+
+    def genre_selected(self, index):
+        """Load the selected genre into the editing controls."""
+        if index < 0 or index >= len(self.genres):
+            return
+        self.editing_index = index
+        self.name_edit.setText(self.genres[index]["name"])
+        self.prompt_edit.setPlainText(self.genres[index]["prompt"])
+        self.delete_button.setEnabled(True)
+
+    def new_genre(self):
+        """Clear the form so Save creates a new genre."""
+        self.genre_list.clearSelection()
+        self.genre_list.setCurrentRow(-1)
+        self.editing_index = None
+        self.name_edit.clear()
+        self.prompt_edit.clear()
+        self.delete_button.setEnabled(False)
+        self.name_edit.setFocus()
+
+    def save_genre(self):
+        """Add a new genre or update the selected one."""
+        name = self.name_edit.text().strip()
+        prompt = self.prompt_edit.toPlainText().strip()
+        if not name or not prompt:
+            QMessageBox.warning(self, "Incomplete genre", "Enter both a genre name and prompt.")
+            return
+
+        for index, genre in enumerate(self.genres):
+            if index != self.editing_index and genre["name"].casefold() == name.casefold():
+                QMessageBox.warning(self, "Duplicate genre", f'A genre named "{name}" already exists.')
+                return
+
+        previous_genres = [dict(genre) for genre in self.genres]
+        genre = {"name": name, "prompt": prompt}
+        if self.editing_index is None:
+            self.genres.append(genre)
+            selected_index = len(self.genres) - 1
+        else:
+            self.genres[self.editing_index] = genre
+            selected_index = self.editing_index
+
+        if not self.persist_changes():
+            self.genres = previous_genres
+            return
+        self.refresh_list(selected_index)
+
+    def delete_genre(self):
+        """Delete the selected genre after confirmation."""
+        if self.editing_index is None:
+            return
+        genre = self.genres[self.editing_index]
+        if QMessageBox.question(
+            self,
+            "Delete genre",
+            f'Delete the "{genre["name"]}" genre?',
+        ) != QMessageBox.Yes:
+            return
+
+        deleted_index = self.editing_index
+        del self.genres[deleted_index]
+        if not self.persist_changes():
+            self.genres.insert(deleted_index, genre)
+            return
+        self.editing_index = None
+        self.name_edit.clear()
+        self.prompt_edit.clear()
+        self.refresh_list(min(deleted_index, len(self.genres) - 1) if self.genres else None)
+        self.delete_button.setEnabled(bool(self.genres))
+
+    def persist_changes(self):
+        """Write the current genre collection and notify the main window."""
+        try:
+            save_genres(self.genres_path, self.genres)
+        except (OSError, TypeError, ValueError) as exc:
+            QMessageBox.critical(self, "Could not save genres", str(exc))
+            return False
+        self.genres_changed.emit([dict(genre) for genre in self.genres])
+        return True
+
+
 class VeniceChatWorker(QObject):
     """Call Venice AI without blocking the Qt event loop."""
 
     finished = Signal(str, str, object)
     failed = Signal(str)
 
-    def __init__(self, api_key, model, prompt, history, max_tokens):
+    def __init__(self, api_key, model, prompt, history, max_tokens, system_prompt=SYSTEM_PROMPT):
         super().__init__()
         self.api_key = api_key
         self.model = model
         self.prompt = prompt
         self.history = history
         self.max_tokens = max_tokens
+        self.system_prompt = system_prompt
 
     def run(self):
         """Send a chat completion request and emit the generated response."""
@@ -202,12 +507,7 @@ class VeniceChatWorker(QObject):
 
     def messages(self):
         """Return the system prompt, prior turns, and the new user prompt."""
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for entry in self.history:
-            messages.append({"role": "user", "content": entry.prompt})
-            messages.append({"role": "assistant", "content": entry.response})
-        messages.append({"role": "user", "content": self.prompt})
-        return messages
+        return build_chat_messages(self.system_prompt, self.history, self.prompt)
 
 
 class VeniceChatModelsWorker(QObject):
@@ -262,9 +562,19 @@ class StoryWriterWindow(QMainWindow):
         self.worker = None
         self.models_thread = None
         self.models_worker = None
+        self.models_loaded_once = False
+        self.pending_send_after_models = False
         self.pending_prompt = ""
         self.current_entry = None
         self.conversation_history = []
+        self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        self.genres_path = Path(self.settings.fileName()).parent / GENRES_FILENAME
+        try:
+            self.genres = load_genres(self.genres_path)
+            self.genres_load_error = ""
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            self.genres = [dict(genre) for genre in DEFAULT_GENRES]
+            self.genres_load_error = str(exc)
 
         self.setWindowTitle("Venice AI Story Writer")
         self.resize(980, 760)
@@ -274,9 +584,12 @@ class StoryWriterWindow(QMainWindow):
         self.api_key_edit.setPlaceholderText("VENICE_API_KEY")
 
         self.model_combo = QComboBox()
+        self.model_options = {}
         for model_id in MODELS:
+            self.model_options[model_id] = ChatModelOption(model_id, model_id)
             self.model_combo.addItem(model_id, model_id)
         self.model_combo.setCurrentText(DEFAULT_MODEL)
+        self.model_combo.currentIndexChanged.connect(self.update_cost_estimate)
 
         self.refresh_models_button = QPushButton("Refresh Models")
         self.refresh_models_button.clicked.connect(self.refresh_models)
@@ -285,6 +598,18 @@ class StoryWriterWindow(QMainWindow):
         self.max_tokens_spin.setRange(1024, 32768)
         self.max_tokens_spin.setSingleStep(1024)
         self.max_tokens_spin.setValue(8192)
+        self.max_tokens_spin.valueChanged.connect(self.update_cost_estimate)
+
+        self.genre_combo = QComboBox()
+        self.populate_genre_combo()
+        self.genre_combo.currentIndexChanged.connect(self.genre_changed)
+        self.genre_combo.currentIndexChanged.connect(self.update_cost_estimate)
+        self.genre_editor_button = QPushButton("Edit Genres")
+        self.genre_editor_button.clicked.connect(self.open_genre_editor)
+
+        self.cost_label = QLabel()
+        self.cost_label.setWordWrap(True)
+        self.cost_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
         self.story_display = QTextBrowser()
         self.story_display.setReadOnly(True)
@@ -295,6 +620,7 @@ class StoryWriterWindow(QMainWindow):
         self.prompt_input.setAcceptRichText(False)
         self.prompt_input.setPlaceholderText("Write the next prompt...")
         self.prompt_input.submitted.connect(self.send_prompt)
+        self.prompt_input.textChanged.connect(self.update_cost_estimate)
 
         self.send_button = QPushButton("Send")
         self.send_button.clicked.connect(self.send_prompt)
@@ -322,6 +648,15 @@ class StoryWriterWindow(QMainWindow):
 
         shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
         shortcut.activated.connect(self.send_prompt)
+        self.update_cost_estimate()
+
+        if self.genres_load_error:
+            QMessageBox.warning(
+                self,
+                "Could not load genres",
+                f"The genre file could not be loaded. Built-in defaults will be used.\n\n"
+                f"{self.genres_path}\n\n{self.genres_load_error}",
+            )
 
         if self.api_key_edit.text().strip():
             self.refresh_models()
@@ -332,6 +667,8 @@ class StoryWriterWindow(QMainWindow):
         settings_form.addRow("API key", self.api_key_edit)
         settings_form.addRow("Model", self.row(self.model_combo, self.refresh_models_button))
         settings_form.addRow("Max tokens", self.max_tokens_spin)
+        settings_form.addRow("Estimated cost", self.cost_label)
+        settings_form.addRow("Genre", self.row(self.genre_combo, self.genre_editor_button))
 
         settings_panel = QWidget()
         settings_panel.setLayout(settings_form)
@@ -441,6 +778,80 @@ class StoryWriterWindow(QMainWindow):
             return str(data).strip()
         return self.model_combo.currentText().strip()
 
+    def selected_model_option(self):
+        """Return metadata for the selected model when it has been loaded."""
+        model_id = self.selected_model()
+        return self.model_options.get(model_id, ChatModelOption(model_id, model_id))
+
+    def estimated_request_messages(self):
+        """Build the messages used by the live token and cost estimate."""
+        return build_chat_messages(
+            build_system_prompt(self.selected_genre()),
+            self.conversation_history,
+            self.prompt_input.toPlainText().strip(),
+        )
+
+    def update_cost_estimate(self, *_args):
+        """Show an estimated maximum cost for the next request."""
+        if not hasattr(self, "cost_label") or not hasattr(self, "prompt_input"):
+            return
+        input_tokens = estimate_message_tokens(self.estimated_request_messages())
+        option = self.selected_model_option()
+        estimate = text_generation_cost(
+            option.pricing,
+            input_tokens,
+            self.max_tokens_spin.value(),
+        )
+        self.cost_label.setText(estimate["display"])
+
+    def populate_genre_combo(self, preferred_name=None):
+        """Fill the genre selector while preserving a named selection."""
+        selected_name = preferred_name
+        if selected_name is None and hasattr(self, "genre_combo"):
+            selected_name = self.genre_combo.currentData()
+        if not selected_name:
+            selected_name = self.settings.value(SELECTED_GENRE_SETTING, "General", str)
+
+        self.genre_combo.blockSignals(True)
+        self.genre_combo.clear()
+        for genre in self.genres:
+            self.genre_combo.addItem(genre["name"], genre["name"])
+        index = self.genre_combo.findData(selected_name)
+        if index < 0 and self.genre_combo.count():
+            index = 0
+        self.genre_combo.setCurrentIndex(index)
+        self.genre_combo.blockSignals(False)
+        if index >= 0:
+            self.genre_changed(index)
+
+    def genre_changed(self, _index):
+        """Remember the selected genre."""
+        name = self.genre_combo.currentData()
+        if name:
+            self.settings.setValue(SELECTED_GENRE_SETTING, name)
+
+    def selected_genre(self):
+        """Return the complete selected genre record."""
+        selected_name = self.genre_combo.currentData()
+        for genre in self.genres:
+            if genre["name"] == selected_name:
+                return genre
+        return {}
+
+    def open_genre_editor(self):
+        """Open the modal editor for persisted genre instructions."""
+        dialog = GenreEditorDialog(self.genres, self.genres_path, self)
+        dialog.genres_changed.connect(self.genres_updated)
+        dialog.exec()
+
+    def genres_updated(self, genres):
+        """Apply genre changes from the editor to the selector."""
+        selected_name = self.genre_combo.currentData()
+        self.genres = [dict(genre) for genre in genres]
+        self.populate_genre_combo(selected_name)
+        self.update_cost_estimate()
+        self.status_label.setText(f"Saved {len(self.genres)} genres to {self.genres_path.name}.")
+
     def refresh_models(self):
         """Refresh uncensored chat models from Venice."""
         if self.models_thread:
@@ -470,6 +881,8 @@ class StoryWriterWindow(QMainWindow):
     def models_loaded(self, options):
         """Populate the model selector with uncensored chat models."""
         current_model = self.selected_model()
+        self.models_loaded_once = True
+        self.model_options = {option.model_id: option for option in options}
         self.model_combo.clear()
         for option in options:
             self.model_combo.addItem(option.label, option.model_id)
@@ -480,11 +893,16 @@ class StoryWriterWindow(QMainWindow):
         if index >= 0:
             self.model_combo.setCurrentIndex(index)
 
+        self.update_cost_estimate()
         self.refresh_models_button.setEnabled(True)
         self.status_label.setText(f"Loaded {len(options)} uncensored chat models.")
+        if self.pending_send_after_models:
+            self.pending_send_after_models = False
+            self.send_prompt()
 
     def models_failed(self, message):
         """Display model refresh errors without clearing fallback models."""
+        self.pending_send_after_models = False
         self.refresh_models_button.setEnabled(True)
         self.status_label.setText("Model refresh failed.")
         QMessageBox.critical(self, "Model refresh failed", message)
@@ -508,6 +926,14 @@ class StoryWriterWindow(QMainWindow):
             QMessageBox.warning(self, "Missing API key", "Enter your Venice AI API key first.")
             return
 
+        if self.selected_model_option().pricing is None and not self.models_loaded_once:
+            self.pending_send_after_models = True
+            if not self.models_thread:
+                self.refresh_models()
+            self.status_label.setText("Loading model pricing before sending...")
+            return
+
+        self.update_cost_estimate()
         self.pending_prompt = prompt
         self.story_display.clear()
         self.set_generating(True)
@@ -520,6 +946,7 @@ class StoryWriterWindow(QMainWindow):
             prompt,
             list(self.conversation_history),
             self.max_tokens_spin.value(),
+            build_system_prompt(self.selected_genre()),
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -539,6 +966,7 @@ class StoryWriterWindow(QMainWindow):
         self.current_entry = entry
         self.conversation_history.append(entry)
         self.refresh_response_display(response)
+        self.update_cost_estimate()
         self.status_label.setText(self.response_status(response, finish_reason, usage))
         self.set_generating(False)
 
@@ -801,6 +1229,7 @@ class StoryWriterWindow(QMainWindow):
             self.story_display.clear()
             self.current_entry = None
             self.conversation_history.clear()
+            self.update_cost_estimate()
             self.status_label.setText("Story cleared.")
 
     def save_story(self):
@@ -813,7 +1242,7 @@ class StoryWriterWindow(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Save story",
-            "",
+            str(self.last_save_directory()),
             self.save_file_filter(file_format),
         )
         if not filename:
@@ -824,7 +1253,23 @@ class StoryWriterWindow(QMainWindow):
             self.story_content_for_format(file_format),
             encoding="utf-8",
         )
+        self.remember_save_directory(path)
         self.status_label.setText(f"Saved story to {path.name}")
+
+    def last_save_directory(self):
+        """Return the persisted save directory, falling back to the working directory."""
+        saved_directory = self.settings.value(SAVE_DIRECTORY_SETTING, "", str).strip()
+        if saved_directory:
+            path = Path(saved_directory).expanduser()
+            if path.is_dir():
+                return path
+        return Path.cwd()
+
+    def remember_save_directory(self, file_path):
+        """Persist the parent directory of a successfully saved file."""
+        directory = Path(file_path).expanduser().resolve().parent
+        self.settings.setValue(SAVE_DIRECTORY_SETTING, str(directory))
+        self.settings.sync()
 
     @staticmethod
     def save_file_filter(file_format):
@@ -898,7 +1343,7 @@ class StoryWriterWindow(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Export full chat",
-            "",
+            str(self.last_save_directory()),
             "Markdown files (*.md);;Text files (*.txt);;All files (*)",
         )
         if not filename:
@@ -929,8 +1374,10 @@ class StoryWriterWindow(QMainWindow):
                 ]
             )
 
-        Path(filename).write_text("\n".join(lines), encoding="utf-8")
-        self.status_label.setText(f"Exported chat to {Path(filename).name}")
+        path = Path(filename)
+        path.write_text("\n".join(lines), encoding="utf-8")
+        self.remember_save_directory(path)
+        self.status_label.setText(f"Exported chat to {path.name}")
 
     def save_html(self):
         """Export the latest rendered response as an HTML document."""
@@ -941,7 +1388,7 @@ class StoryWriterWindow(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Export rendered HTML",
-            "",
+            str(self.last_save_directory()),
             "HTML files (*.html);;All files (*)",
         )
         if not filename:
@@ -952,6 +1399,7 @@ class StoryWriterWindow(QMainWindow):
             path = path.with_suffix(".html")
 
         path.write_text(self.response_html(self.current_entry.response), encoding="utf-8")
+        self.remember_save_directory(path)
         self.status_label.setText(f"Exported HTML to {path.name}")
 
     def set_generating(self, generating):
@@ -967,6 +1415,8 @@ class StoryWriterWindow(QMainWindow):
         self.model_combo.setEnabled(not generating)
         self.refresh_models_button.setEnabled(not generating and self.models_thread is None)
         self.max_tokens_spin.setEnabled(not generating)
+        self.genre_combo.setEnabled(not generating)
+        self.genre_editor_button.setEnabled(not generating)
         self.prompt_input.setEnabled(not generating)
 
     def closeEvent(self, event):
@@ -987,6 +1437,7 @@ class StoryWriterWindow(QMainWindow):
             )
             event.ignore()
             return
+        self.settings.sync()
         super().closeEvent(event)
 
 
