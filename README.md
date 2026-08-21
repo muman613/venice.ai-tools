@@ -62,7 +62,9 @@ The video applications ask for a key at startup when `VENICE_API_KEY` is not pre
 
 ## Story Writer
 
-<img src="images/story-writer.png" alt="Venice AI Story Writer" width="50%">
+<p align="center">
+  <img src="images/story-writer.png" alt="Venice AI Story Writer" width="75%">
+</p>
 
 Start the application:
 
@@ -87,7 +89,9 @@ Custom genres are stored in a JSON file beside the application's platform settin
 
 ## Image Generator
 
-<img src="images/image-generator.png" alt="Venice AI Image Generator" width="50%">
+<p align="center">
+  <img src="images/image-generator.png" alt="Venice AI Image Generator" width="75%">
+</p>
 
 Start the application:
 
@@ -116,7 +120,9 @@ Use the **Prompt** menu to save a complete prompt configuration as JSON, save th
 
 ## Video Generator
 
-<img src="images/video-generator.png" alt="Venice AI Video Generator" width="50%">
+<p align="center">
+  <img src="images/video-generator.png" alt="Venice AI Video Generator" width="75%">
+</p>
 
 Start the application:
 
@@ -152,7 +158,9 @@ Some Seedance requests require explicit face-processing consent. If Venice retur
 
 ## Classic one-minute video generator
 
-<img src="images/video-classic.png" alt="Venice AI Classic One-Minute Video Generator" width="50%">
+<p align="center">
+  <img src="images/video-classic.png" alt="Venice AI Classic One-Minute Video Generator" width="75%">
+</p>
 
 Start the classic workflow:
 
@@ -173,7 +181,9 @@ Use `venice-ai-video.py` for new projects that need live model selection, text-t
 
 ## Text to Speech
 
-<img src="images/text-to-speech.png" alt="Venice AI Text-to-Speech Queue" width="50%">
+<p align="center">
+  <img src="images/text-to-speech.png" alt="Venice AI Text-to-Speech Queue" width="75%">
+</p>
 
 Start the application:
 
