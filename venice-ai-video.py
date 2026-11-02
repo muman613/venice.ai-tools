@@ -967,8 +967,13 @@ class VeniceVideoWorker(QObject):
 
         self.progress.emit(
             0,
-            f"Estimated video generation cost: ${total:.4f}",
+            self.format_generation_cost(total),
         )
+
+    @staticmethod
+    def format_generation_cost(total):
+        """Return the user-facing total for a successful video quote."""
+        return f"Estimated video generation cost: ${total:.4f}"
 
     # ------------------------------------------------------------------
     # Validation

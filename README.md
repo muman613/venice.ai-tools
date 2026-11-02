@@ -13,6 +13,7 @@ The repository is available on GitHub at [muman613/venice.ai-tools](https://gith
 | Story Writer | `venice-ai-story-writer.py` | Write and revise long-form Markdown with Venice chat models. |
 | Image Generator | `venice-ai-image.py` | Generate image variants with model-aware dimensions, styles, and parameters. |
 | Video Generator | `venice-ai-video.py` | Build variable-length image-to-video or text-to-video projects from sequential clips. |
+| Video Project Builder | `venice-ai-video-project.py` | Author audio-length, multi-scene videos with reusable character references and 30-second clips. |
 | Classic Video Generator | `venice-ai-video-classic.py` | Build a fixed one-minute video from four Wan 2.7 image-to-video clips. |
 | Text to Speech | `venice-ai-tts.py` | Queue TXT and HTML documents for conversion to MP3. |
 | Model Listing Helper | `list-models.py` | Print model metadata matching Wan 2.7 from the Venice models endpoint. |
@@ -79,13 +80,16 @@ Use the Story Writer to develop prompts and produce long-form Markdown:
 3. Choose a genre. Select **Edit Genres** to add, change, or delete reusable genre instructions.
 4. Enter a request and select **Send**, or press `Ctrl+Enter`.
 5. Revise the request and send it again to continue the in-memory conversation.
-6. Save the latest response as TXT, Markdown, or HTML, or export the complete chat as Markdown.
+6. Save the latest response as TXT, Markdown, or HTML, or export all session prompts and responses as Markdown.
+7. To create an MP3 narration of the latest response, choose a speech model and voice, then select **Save Audio** and choose an output file.
 
 The cost line estimates the next request's maximum USD cost from live model pricing. Input tokens are approximated locally and output cost is calculated from the selected maximum token count, so the actual cost may be lower.
 
-The request remains in the editor after generation to make prompt iteration easier. **Clear** removes only the request text; **Clear Chat** removes the visible response and in-memory conversation history. Chat history is not saved automatically.
+The prompt remains in the editor after generation to make iteration easier. **Clear Prompt** asks for confirmation and removes only the current prompt text while preserving the session context. **Clear Response** asks for confirmation and removes the visible response and all in-memory prompt/response context. Session context is not saved automatically.
 
 Custom genres are stored in a JSON file beside the application's platform settings file. Successful save and export locations are remembered between runs.
+
+Story audio uses the same chunked Venice text-to-speech implementation as the standalone TTS tool. Markdown formatting is removed before narration, and conversion runs in the background so the window remains responsive. The selected speech model and voice are remembered between runs.
 
 ## Image Generator
 
@@ -155,6 +159,34 @@ For either mode, the requested duration must be expressible using durations supp
 Use **Load Prompt** and **Save Prompt** for TXT or Markdown prompt files. Enable **Retain intermediate files** to keep the generated segment MP4s, continuation-frame images, and segment-plan JSON. When the option is disabled, those artifacts are removed after the final MP4 has been validated. The retention choice, starting-image path, and prompt directory are remembered between runs.
 
 Some Seedance requests require explicit face-processing consent. If Venice returns that requirement, the application displays the provider's explanation and asks before resubmitting the request with consent.
+
+## Video Project Builder
+
+Start the scene-queue workflow with:
+
+```bash
+python venice-ai-video-project.py
+```
+
+For complete setup, authoring, generation, file-management, and troubleshooting
+instructions, see the [Video Project Builder user manual](docs/venice-ai-video-project-user-manual.md).
+
+This application is intended for longer videos authored as individual cut-scenes:
+
+1. Enter a project name and output directory.
+2. Select an MP3 soundtrack. FFprobe reads its duration and creates a queue of 30-second scenes. The final scene is rounded up to 10, 15, or 30 seconds, and the completed video is trimmed to the soundtrack.
+3. Enter the overall visual style. It is prepended to every scene prompt.
+4. Create reusable characters with a name, text description, and optional reference image. Characters are stored in `~/.local/share/venice-ai-video/characters.json` and can be inspected, renamed, edited, or deleted.
+5. Select each queued scene, write its prompt, and check the characters appearing in it.
+6. Choose a live model that advertises 30-second generation. Reference-to-video models receive the checked character images; text-to-video models receive their descriptions.
+7. Select **Estimate Cost** to retrieve and display a live quote in Venice credits without queueing any video jobs.
+8. Select **Start Generation**. Scene files are saved as `<project>-scene-1.mp4`, `<project>-scene-2.mp4`, and so on, then stitched into `<project>.mp4`. On later runs, existing scene files with a video stream and the expected duration are reused; invalid or incorrectly timed scenes are regenerated.
+
+By default, all model-generated audio is removed and the MP3 is encoded as the final stereo AAC track. Clear the audio-removal checkbox to mix model-generated audio with the MP3 instead. The editable project is automatically saved beside the output as `<project>.venice-video-project.json`; it can also be saved or loaded manually.
+
+Loading a project immediately scans its expected scene files and marks valid,
+correctly timed clips with checkmarks. Cost estimates exclude those reusable
+clips and quote only scenes that are missing or invalid.
 
 ## Classic one-minute video generator
 

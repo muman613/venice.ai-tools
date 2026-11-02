@@ -267,21 +267,52 @@ def text_file_to_mp3(
     Long files are split into request-sized chunks. Returned MP3 chunks are
     appended into the output file in order.
     """
-    voice_id = normalize_voice(voice_id, model)
     text_file_path = Path(text_file_path)
     if not text_file_path.is_file():
         raise TextToSpeechError(f"Text file does not exist: {text_file_path}")
 
     text = text_file_path.read_text(encoding="utf-8")
+    if not text.strip():
+        raise TextToSpeechError(f"Text file is empty: {text_file_path}")
+    output_path = Path(output_path) if output_path else text_file_path.with_suffix(".mp3")
+    return text_to_mp3(
+        text,
+        output_path,
+        voice_id,
+        api_key=api_key,
+        model=model,
+        chunk_size=chunk_size,
+        delay_seconds=delay_seconds,
+        timeout=timeout,
+        progress_callback=progress_callback,
+        source_description=str(text_file_path),
+    )
+
+
+def text_to_mp3(
+    text,
+    output_path,
+    voice_id="default",
+    *,
+    api_key=None,
+    model=DEFAULT_MODEL,
+    chunk_size=DEFAULT_CHUNK_SIZE,
+    delay_seconds=DEFAULT_DELAY_SECONDS,
+    timeout=DEFAULT_TIMEOUT_SECONDS,
+    progress_callback=None,
+    source_description="text",
+):
+    """Convert in-memory text to one MP3 file using Venice TTS."""
+    voice_id = normalize_voice(voice_id, model)
     chunks = chunk_text(text, chunk_size)
     if not chunks:
-        raise TextToSpeechError(f"Text file is empty: {text_file_path}")
+        raise TextToSpeechError("Text to convert is empty.")
 
-    output_path = Path(output_path) if output_path else text_file_path.with_suffix(".mp3")
+    output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     LOGGER.info(
-        "Starting TTS file conversion: input=%s output=%s model=%s voice=%s chars=%s chunks=%s chunk_size=%s delay=%ss",
-        text_file_path,
+        "Starting TTS conversion: source=%s output=%s model=%s voice=%s chars=%s chunks=%s chunk_size=%s delay=%ss",
+        source_description,
         output_path,
         model,
         voice_id,
@@ -300,8 +331,8 @@ def text_file_to_mp3(
             if progress_callback:
                 progress_callback(index, len(chunks), f"Converting chunk {index} of {len(chunks)}")
             LOGGER.info(
-                "Converting TTS chunk: input=%s chunk=%s/%s chars=%s",
-                text_file_path,
+                "Converting TTS chunk: source=%s chunk=%s/%s chars=%s",
+                source_description,
                 index,
                 len(chunks),
                 len(chunk),
@@ -326,7 +357,7 @@ def text_file_to_mp3(
 
     if progress_callback:
         progress_callback(len(chunks), len(chunks), "Conversion complete")
-    LOGGER.info("Completed TTS file conversion: output=%s chunks=%s", output_path, len(chunks))
+    LOGGER.info("Completed TTS conversion: output=%s chunks=%s", output_path, len(chunks))
     return output_path
 
 

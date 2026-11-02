@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -35,7 +36,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from modules.tts import get_venice_api_key
+from modules.tts import (
+    TTS_MODELS,
+    TextToSpeechError,
+    default_voice_for_model,
+    get_venice_api_key,
+    model_label,
+    text_to_mp3,
+    voices_for_model,
+)
 
 
 API_URL = "https://api.venice.ai/api/v1/chat/completions"
@@ -54,6 +63,8 @@ SETTINGS_ORG = "VeniceAI"
 SETTINGS_APP = "StoryWriter"
 SELECTED_GENRE_SETTING = "story/selected_genre"
 SAVE_DIRECTORY_SETTING = "paths/save_directory"
+TTS_MODEL_SETTING = "tts/model"
+TTS_VOICE_SETTING_PREFIX = "tts/voice"
 GENRES_FILENAME = "venice-ai-story-writer-genres.json"
 DEFAULT_GENRES = (
     {
@@ -542,6 +553,39 @@ class VeniceChatModelsWorker(QObject):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+class StorySpeechWorker(QObject):
+    """Convert a story response to MP3 without blocking the Qt event loop."""
+
+    progress_changed = Signal(int, int, str)
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, text, output_path, api_key, model, voice_id):
+        super().__init__()
+        self.text = text
+        self.output_path = Path(output_path)
+        self.api_key = api_key
+        self.model = model
+        self.voice_id = voice_id
+
+    def run(self):
+        """Convert the captured story text and report completion."""
+        try:
+            output_path = text_to_mp3(
+                self.text,
+                self.output_path,
+                self.voice_id,
+                api_key=self.api_key,
+                model=self.model,
+                progress_callback=self.progress_changed.emit,
+                source_description="story response",
+            )
+        except (OSError, TextToSpeechError) as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(str(output_path))
+
+
 class PromptEdit(QTextEdit):
     """Text edit that submits with Ctrl+Enter."""
 
@@ -563,6 +607,8 @@ class StoryWriterWindow(QMainWindow):
         self.worker = None
         self.models_thread = None
         self.models_worker = None
+        self.speech_thread = None
+        self.speech_worker = None
         self.models_loaded_once = False
         self.pending_send_after_models = False
         self.pending_prompt = ""
@@ -608,6 +654,16 @@ class StoryWriterWindow(QMainWindow):
         self.genre_editor_button = QPushButton("Edit Genres")
         self.genre_editor_button.clicked.connect(self.open_genre_editor)
 
+        self.tts_model_combo = QComboBox()
+        for model in TTS_MODELS:
+            self.tts_model_combo.addItem(model_label(model), model)
+        self.tts_model_combo.currentIndexChanged.connect(self.tts_model_changed)
+
+        self.tts_voice_combo = QComboBox()
+        self.tts_voice_combo.setEditable(True)
+        self.tts_voice_combo.currentTextChanged.connect(self.remember_tts_voice)
+        self.restore_tts_settings()
+
         self.cost_label = QLabel()
         self.cost_label.setWordWrap(True)
         self.cost_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -625,10 +681,10 @@ class StoryWriterWindow(QMainWindow):
 
         self.send_button = QPushButton("Send")
         self.send_button.clicked.connect(self.send_prompt)
-        self.clear_prompt_button = QPushButton("Clear")
+        self.clear_prompt_button = QPushButton("Clear Prompt")
         self.clear_prompt_button.clicked.connect(self.clear_prompt)
-        self.clear_story_button = QPushButton("Clear Chat")
-        self.clear_story_button.clicked.connect(self.clear_story)
+        self.clear_response_button = QPushButton("Clear Response")
+        self.clear_response_button.clicked.connect(self.clear_response)
         self.save_story_button = QPushButton("Save Story")
         self.save_story_button.clicked.connect(self.save_story)
         self.save_format_combo = QComboBox()
@@ -636,10 +692,17 @@ class StoryWriterWindow(QMainWindow):
         self.save_format_combo.addItem("MD", "md")
         self.save_format_combo.addItem("HTML", "html")
         self.save_format_combo.setCurrentText("MD")
-        self.save_chat_button = QPushButton("Export Chat")
-        self.save_chat_button.clicked.connect(self.save_full_chat)
+        self.export_session_button = QPushButton("Export Session")
+        self.export_session_button.clicked.connect(self.export_session)
         self.save_html_button = QPushButton("Export HTML")
         self.save_html_button.clicked.connect(self.save_html)
+        self.save_audio_button = QPushButton("Save Audio")
+        self.save_audio_button.clicked.connect(self.save_audio)
+
+        self.speech_progress = QProgressBar()
+        self.speech_progress.setRange(0, 1)
+        self.speech_progress.setValue(0)
+        self.speech_progress.setVisible(False)
 
         self.status_label = QLabel("Ready")
         self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -670,6 +733,7 @@ class StoryWriterWindow(QMainWindow):
         settings_form.addRow("Max tokens", self.max_tokens_spin)
         settings_form.addRow("Estimated cost", self.cost_label)
         settings_form.addRow("Genre", self.row(self.genre_combo, self.genre_editor_button))
+        settings_form.addRow("Speech", self.row(self.tts_model_combo, self.tts_voice_combo))
 
         settings_panel = QWidget()
         settings_panel.setLayout(settings_form)
@@ -697,18 +761,20 @@ class StoryWriterWindow(QMainWindow):
         buttons = QHBoxLayout()
         buttons.addWidget(self.send_button)
         buttons.addWidget(self.clear_prompt_button)
-        buttons.addWidget(self.clear_story_button)
+        buttons.addWidget(self.clear_response_button)
         buttons.addStretch(1)
         buttons.addWidget(QLabel("Save as"))
         buttons.addWidget(self.save_format_combo)
         buttons.addWidget(self.save_story_button)
-        buttons.addWidget(self.save_chat_button)
+        buttons.addWidget(self.export_session_button)
         buttons.addWidget(self.save_html_button)
+        buttons.addWidget(self.save_audio_button)
 
         layout = QVBoxLayout()
         layout.addWidget(settings_panel)
         layout.addWidget(splitter, 1)
         layout.addLayout(buttons)
+        layout.addWidget(self.speech_progress)
         layout.addWidget(self.status_label)
 
         central = QWidget()
@@ -778,6 +844,46 @@ class StoryWriterWindow(QMainWindow):
         if data:
             return str(data).strip()
         return self.model_combo.currentText().strip()
+
+    def current_tts_model(self):
+        """Return the selected Venice text-to-speech model ID."""
+        return self.tts_model_combo.currentData() or self.tts_model_combo.currentText()
+
+    def restore_tts_settings(self):
+        """Restore the speech model and its most recently selected voice."""
+        saved_model = self.settings.value(TTS_MODEL_SETTING, TTS_MODELS[0], str)
+        model_index = self.tts_model_combo.findData(saved_model)
+        if model_index >= 0:
+            self.tts_model_combo.setCurrentIndex(model_index)
+        self.update_tts_voice_options()
+
+    def tts_model_changed(self, *_args):
+        """Persist the speech model and show its available voices."""
+        self.settings.setValue(TTS_MODEL_SETTING, self.current_tts_model())
+        self.update_tts_voice_options()
+
+    def update_tts_voice_options(self):
+        """Refresh voice choices for the selected speech model."""
+        model = self.current_tts_model()
+        saved_voice = self.settings.value(
+            f"{TTS_VOICE_SETTING_PREFIX}/{model}",
+            default_voice_for_model(model),
+            str,
+        )
+        self.tts_voice_combo.blockSignals(True)
+        self.tts_voice_combo.clear()
+        self.tts_voice_combo.addItems(voices_for_model(model))
+        self.tts_voice_combo.setCurrentText(saved_voice)
+        self.tts_voice_combo.blockSignals(False)
+
+    def remember_tts_voice(self, voice):
+        """Remember the current model's speech voice."""
+        voice = voice.strip()
+        if voice:
+            self.settings.setValue(
+                f"{TTS_VOICE_SETTING_PREFIX}/{self.current_tts_model()}",
+                voice,
+            )
 
     def selected_model_option(self):
         """Return metadata for the selected model when it has been loaded."""
@@ -1216,22 +1322,35 @@ class StoryWriterWindow(QMainWindow):
         """
 
     def clear_prompt(self):
-        """Clear only the request editor, preserving response and chat history."""
+        """Clear only the prompt editor, preserving the retained session context."""
         if not self.prompt_input.toPlainText().strip():
             return
-        self.prompt_input.clear()
-        self.status_label.setText("Prompt cleared.")
+        if QMessageBox.question(
+            self,
+            "Clear prompt",
+            "Clear the current prompt? The retained prompt and response context will be preserved.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) == QMessageBox.Yes:
+            self.prompt_input.clear()
+            self.status_label.setText("Prompt cleared. Previous context is still retained.")
 
-    def clear_story(self):
-        """Clear all displayed text and structured chat history."""
+    def clear_response(self):
+        """Clear the displayed response and all retained session context."""
         if not self.conversation_history and not self.story_display.toPlainText().strip():
             return
-        if QMessageBox.question(self, "Clear story", "Clear all story text?") == QMessageBox.Yes:
+        if QMessageBox.question(
+            self,
+            "Clear response",
+            "Clear the response and all retained prompt and response context?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) == QMessageBox.Yes:
             self.story_display.clear()
             self.current_entry = None
             self.conversation_history.clear()
             self.update_cost_estimate()
-            self.status_label.setText("Story cleared.")
+            self.status_label.setText("Response and retained context cleared.")
 
     def save_story(self):
         """Save only the latest generated response in the selected format."""
@@ -1335,15 +1454,15 @@ class StoryWriterWindow(QMainWindow):
             return self.story_html()
         return self.story_markdown()
 
-    def save_full_chat(self):
+    def export_session(self):
         """Save prompts and responses as Markdown."""
         if not self.conversation_history:
-            QMessageBox.warning(self, "No chat", "No chat history to export.")
+            QMessageBox.warning(self, "No session", "No prompts and responses to export.")
             return
 
         filename, _ = QFileDialog.getSaveFileName(
             self,
-            "Export full chat",
+            "Export prompts and responses",
             str(self.last_save_directory()),
             "Markdown files (*.md);;Text files (*.txt);;All files (*)",
         )
@@ -1378,7 +1497,7 @@ class StoryWriterWindow(QMainWindow):
         path = Path(filename)
         path.write_text("\n".join(lines), encoding="utf-8")
         self.remember_save_directory(path)
-        self.status_label.setText(f"Exported chat to {path.name}")
+        self.status_label.setText(f"Exported session to {path.name}")
 
     def save_html(self):
         """Export the latest rendered response as an HTML document."""
@@ -1403,15 +1522,127 @@ class StoryWriterWindow(QMainWindow):
         self.remember_save_directory(path)
         self.status_label.setText(f"Exported HTML to {path.name}")
 
+    def save_audio(self):
+        """Convert the latest response to an MP3 using the shared TTS code."""
+        if self.speech_thread or self.thread:
+            return
+        if not self.current_entry:
+            QMessageBox.warning(self, "No story", "No story text to convert to audio.")
+            return
+
+        story_text = self.story_plain_text().strip()
+        if not story_text:
+            QMessageBox.warning(self, "No story", "The story response contains no readable text.")
+            return
+
+        api_key = self.api_key_edit.text().strip()
+        if not api_key:
+            QMessageBox.warning(self, "Missing API key", "Enter your Venice AI API key first.")
+            return
+
+        suggested_path = self.last_save_directory() / datetime.now().strftime(
+            "story-%Y%m%d-%H%M%S.mp3"
+        )
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save story audio",
+            str(suggested_path),
+            "MP3 audio (*.mp3);;All files (*)",
+        )
+        if not filename:
+            return
+
+        output_path = Path(filename)
+        if output_path.suffix.lower() != ".mp3":
+            output_path = output_path.with_suffix(".mp3")
+
+        self.speech_progress.setRange(0, 0)
+        self.speech_progress.setVisible(True)
+        self.set_synthesizing(True)
+        self.status_label.setText("Starting story audio conversion...")
+
+        self.speech_thread = QThread(self)
+        self.speech_worker = StorySpeechWorker(
+            story_text,
+            output_path,
+            api_key,
+            self.current_tts_model(),
+            self.tts_voice_combo.currentText(),
+        )
+        self.speech_worker.moveToThread(self.speech_thread)
+        self.speech_thread.started.connect(self.speech_worker.run)
+        self.speech_worker.progress_changed.connect(self.speech_progress_changed)
+        self.speech_worker.finished.connect(self.speech_finished)
+        self.speech_worker.failed.connect(self.speech_failed)
+        self.speech_worker.finished.connect(self.speech_thread.quit)
+        self.speech_worker.failed.connect(self.speech_thread.quit)
+        self.speech_thread.finished.connect(self.speech_worker.deleteLater)
+        self.speech_thread.finished.connect(self.speech_thread.deleteLater)
+        self.speech_thread.finished.connect(self.clear_speech_worker)
+        self.speech_thread.start()
+
+    def speech_progress_changed(self, current, total, message):
+        """Show text-to-speech chunk progress."""
+        self.speech_progress.setRange(0, total)
+        self.speech_progress.setValue(current)
+        self.status_label.setText(message)
+
+    def speech_finished(self, output_file):
+        """Report a successfully created story MP3."""
+        self.remember_save_directory(output_file)
+        self.speech_progress.setValue(self.speech_progress.maximum())
+        self.status_label.setText(f"Saved story audio to {Path(output_file).name}")
+
+    def speech_failed(self, message):
+        """Report a text-to-speech conversion failure."""
+        self.speech_progress.setRange(0, 1)
+        self.speech_progress.setValue(0)
+        self.status_label.setText("Story audio conversion failed.")
+        QMessageBox.critical(self, "Audio conversion failed", message)
+
+    def clear_speech_worker(self):
+        """Clear finished speech worker references."""
+        self.speech_thread = None
+        self.speech_worker = None
+        self.set_synthesizing(False)
+
+    def set_synthesizing(self, synthesizing):
+        """Enable or disable controls while story audio is generated."""
+        for control in (
+            self.send_button,
+            self.clear_prompt_button,
+            self.clear_response_button,
+            self.save_story_button,
+            self.save_format_combo,
+            self.export_session_button,
+            self.save_html_button,
+            self.api_key_edit,
+            self.model_combo,
+            self.refresh_models_button,
+            self.max_tokens_spin,
+            self.genre_combo,
+            self.genre_editor_button,
+            self.prompt_input,
+            self.tts_model_combo,
+            self.tts_voice_combo,
+            self.save_audio_button,
+        ):
+            control.setEnabled(not synthesizing)
+        if not synthesizing:
+            self.refresh_models_button.setEnabled(self.models_thread is None)
+
     def set_generating(self, generating):
         """Enable or disable controls while a request is running."""
         self.send_button.setEnabled(not generating)
         self.clear_prompt_button.setEnabled(not generating)
-        self.clear_story_button.setEnabled(not generating)
+        self.clear_response_button.setEnabled(not generating)
         self.save_story_button.setEnabled(not generating)
         self.save_format_combo.setEnabled(not generating)
-        self.save_chat_button.setEnabled(not generating)
+        self.export_session_button.setEnabled(not generating)
         self.save_html_button.setEnabled(not generating)
+        self.save_audio_button.setEnabled(not generating)
+        self.tts_model_combo.setEnabled(not generating)
+        self.tts_voice_combo.setEnabled(not generating)
         self.api_key_edit.setEnabled(not generating)
         self.model_combo.setEnabled(not generating)
         self.refresh_models_button.setEnabled(not generating and self.models_thread is None)
@@ -1435,6 +1666,14 @@ class StoryWriterWindow(QMainWindow):
                 self,
                 "Model refresh in progress",
                 "Wait for model refresh to finish before closing.",
+            )
+            event.ignore()
+            return
+        if self.speech_thread:
+            QMessageBox.warning(
+                self,
+                "Audio conversion in progress",
+                "Wait for the story audio conversion to finish before closing.",
             )
             event.ignore()
             return
