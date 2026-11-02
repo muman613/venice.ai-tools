@@ -46,6 +46,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from modules.music_video import OperationCancelled, run_cancellable
+
 
 # ---------------------------------------------------------------------------
 # Venice API configuration
@@ -184,6 +186,10 @@ class VeniceAPIError(RuntimeError):
             f"{url}\n\n"
             f"{body or '<empty response>'}"
         )
+
+
+class GenerationCancelled(RuntimeError):
+    """Raised when a user cancels an active video operation."""
 
 
 def model_text(model):
@@ -663,6 +669,7 @@ class VeniceVideoWorker(QObject):
         self.intermediate_files = []
         self.seedance_consent_event = threading.Event()
         self.seedance_consent_accepted = False
+        self.cancel_event = threading.Event()
 
         self.session = requests.Session()
         self.session.headers.update(
@@ -671,6 +678,19 @@ class VeniceVideoWorker(QObject):
                 "Accept": "application/json",
             }
         )
+
+    def cancel(self):
+        """Request cooperative cancellation from any thread."""
+        self.cancel_event.set()
+        self.seedance_consent_event.set()
+
+    def check_cancelled(self):
+        if self.cancel_event.is_set():
+            raise GenerationCancelled("Generation cancelled by the user.")
+
+    def wait_or_cancel(self, seconds):
+        if self.cancel_event.wait(max(0, float(seconds))):
+            self.check_cancelled()
 
     def run(self):
         """Run segmentation, generation, frame extraction, and stitching."""
@@ -710,6 +730,7 @@ class VeniceVideoWorker(QObject):
             segment_count = len(segments)
 
             for segment in segments:
+                self.check_cancelled()
                 self.progress.emit(
                     segment.number - 1,
                     (
@@ -1884,6 +1905,7 @@ Original video concept:
         reference_data_urls=None,
     ):
         """Queue, poll, download, and save one video segment."""
+        self.check_cancelled()
         video_prompt = self.video_prompt_for_segment(
             segment
         )
@@ -2023,6 +2045,7 @@ Original video concept:
         last_status_progress_time = 0
 
         while time.monotonic() < deadline:
+            self.check_cancelled()
             try:
                 response = self.session.post(
                     VIDEO_RETRIEVE_URL,
@@ -2049,7 +2072,7 @@ Original video concept:
                     ),
                 )
 
-                time.sleep(delay)
+                self.wait_or_cancel(delay)
                 continue
 
             content_type = response.headers.get(
@@ -2139,7 +2162,7 @@ Original video concept:
                         ),
                     )
 
-                    time.sleep(delay)
+                    self.wait_or_cancel(delay)
                     continue
 
                 raise VeniceAPIError(
@@ -2264,7 +2287,7 @@ Original video concept:
             else:
                 completed_without_url = 0
 
-            time.sleep(VIDEO_POLL_INTERVAL_SECONDS)
+            self.wait_or_cancel(VIDEO_POLL_INTERVAL_SECONDS)
 
         raise TimeoutError(
             f"Segment {segment.number}, queue {queue_id}, did not "
@@ -2275,8 +2298,7 @@ Original video concept:
     # Video download
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def download_video(url, output_path):
+    def download_video(self, url, output_path):
         """Download a completed MP4 without forwarding the API key."""
         url = str(url)
 
@@ -2331,6 +2353,7 @@ Original video concept:
                         for chunk in response.iter_content(
                             chunk_size=1024 * 1024,
                         ):
+                            self.check_cancelled()
                             if chunk:
                                 handle.write(chunk)
 
@@ -2354,7 +2377,7 @@ Original video concept:
                 temporary_path.unlink(missing_ok=True)
 
                 if attempt < 4:
-                    time.sleep(min(10, attempt * 2))
+                    self.wait_or_cancel(min(10, attempt * 2))
 
         raise RuntimeError(
             "Could not download the completed video after four "
@@ -2393,7 +2416,7 @@ Original video concept:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def stitch_segments(segment_files, final_path):
+    def stitch_segments(segment_files, final_path, cancel_event=None):
         """Concatenate all segment files into one final MP4."""
         ffmpeg_path = shutil.which("ffmpeg")
 
@@ -2450,23 +2473,34 @@ Original video concept:
                 str(final_path),
             ]
 
-            try:
-                copy_result = subprocess.run(
-                    copy_command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=FFMPEG_STITCH_TIMEOUT_SECONDS,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError(
-                    "FFmpeg timed out while stream-copy stitching "
-                    "the generated segments."
-                ) from exc
+            if cancel_event is not None:
+                try:
+                    run_cancellable(copy_command, cancel_event)
+                except OperationCancelled:
+                    raise
+                except RuntimeError:
+                    copy_result = None
+                else:
+                    copy_result = type("Result", (), {"returncode": 0})()
+            else:
+                try:
+                    copy_result = subprocess.run(
+                        copy_command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=FFMPEG_STITCH_TIMEOUT_SECONDS,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError(
+                        "FFmpeg timed out while stream-copy stitching "
+                        "the generated segments."
+                    ) from exc
 
             if (
-                copy_result.returncode == 0
+                copy_result is not None
+                and copy_result.returncode == 0
                 and final_path.exists()
                 and final_path.stat().st_size > 0
             ):
@@ -2509,20 +2543,24 @@ Original video concept:
                 str(final_path),
             ]
 
-            try:
-                reencode_result = subprocess.run(
-                    reencode_command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=FFMPEG_STITCH_TIMEOUT_SECONDS,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError(
-                    "FFmpeg timed out while re-encoding and stitching "
-                    "the generated segments."
-                ) from exc
+            if cancel_event is not None:
+                run_cancellable(reencode_command, cancel_event)
+                reencode_result = type("Result", (), {"returncode": 0, "stderr": ""})()
+            else:
+                try:
+                    reencode_result = subprocess.run(
+                        reencode_command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=FFMPEG_STITCH_TIMEOUT_SECONDS,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError(
+                        "FFmpeg timed out while re-encoding and stitching "
+                        "the generated segments."
+                    ) from exc
 
             if reencode_result.returncode != 0:
                 raise RuntimeError(

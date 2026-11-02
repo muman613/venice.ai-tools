@@ -1,0 +1,4 @@
+# Optional local preprocessing dependencies for vocal isolation and transcription.
+# Install the base application first with: pip install -r requirements.txt
+demucs>=4.0
+faster-whisper>=1.0

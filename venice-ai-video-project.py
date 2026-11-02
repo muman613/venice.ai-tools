@@ -8,13 +8,14 @@ import json
 import os
 import shutil
 import sys
-import tempfile
-import uuid
+import threading
 from dataclasses import asdict
 from pathlib import Path
 
 import requests
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QFontComboBox,
     QFormLayout,
     QHBoxLayout,
     QInputDialog,
@@ -33,11 +35,32 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QSplitter,
+    QTabWidget,
     QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
+)
+
+from modules.music_video import (
+    OperationCancelled,
+    ProjectPaths,
+    align_lyrics_to_words,
+    burn_subtitles,
+    copy_project_asset,
+    cues_from_words,
+    extract_vocals,
+    format_srt,
+    normalize_video_1080p,
+    offset_cues,
+    parse_srt,
+    prepend_title_card,
+    resolve_project_path,
+    stored_project_path,
+    transcribe_words,
+    validate_cues,
 )
 
 from modules.video_project import (
@@ -196,6 +219,8 @@ class ProjectGenerationWorker(video.VeniceVideoWorker):
     """Generate user-authored scenes, stitch them, and install final audio."""
 
     scene_ready = Signal(int, str, bool, float)
+    billing_state = Signal(bool)
+    cancelled = Signal(str)
 
     @staticmethod
     def format_generation_cost(total):
@@ -208,7 +233,7 @@ class ProjectGenerationWorker(video.VeniceVideoWorker):
         scenes,
         characters,
         overall_style,
-        output_dir,
+        project_paths,
         project_name,
         audio_path,
         remove_generated_audio,
@@ -216,15 +241,28 @@ class ProjectGenerationWorker(video.VeniceVideoWorker):
         model_kind_value,
         resolution,
         aspect_ratio,
+        title_image="",
+        title_duration=5,
+        srt_path="",
+        burn_srt=False,
+        subtitle_font="DejaVu Sans",
+        subtitle_size=22,
     ):
         self.scenes = scenes
         self.characters = characters
         self.overall_style = overall_style
         self.project_name = project_name
+        self.project_paths = project_paths
         self.audio_path = audio_path
         self.remove_generated_audio = remove_generated_audio
         self.model_kind_value = model_kind_value
-        final_path = Path(output_dir) / f"{project_name}.mp4"
+        self.title_image = title_image
+        self.title_duration = float(title_duration)
+        self.srt_path = srt_path
+        self.burn_srt = bool(burn_srt)
+        self.subtitle_font = subtitle_font
+        self.subtitle_size = int(subtitle_size)
+        final_path = project_paths.output / f"{project_name}.mp4"
         super().__init__(
             api_key=api_key,
             prompt=overall_style,
@@ -241,20 +279,17 @@ class ProjectGenerationWorker(video.VeniceVideoWorker):
         )
 
     def run(self):
-        temp_dir = None
+        temp_dir = self.project_paths.temporary
         try:
-            self.destination_dir.mkdir(parents=True, exist_ok=True)
+            self.project_paths.clean_temporary()
+            self.project_paths.create()
             self.verify_dependencies()
-            temp_root = Path(tempfile.gettempdir()) / "venice-ai-video"
-            temp_root.mkdir(parents=True, exist_ok=True)
-            temp_dir = temp_root / f"{self.project_name}-{uuid.uuid4().hex[:10]}"
-            temp_dir.mkdir()
             segment_files = {}
             scenes_to_generate = []
             character_map = {character.name: character for character in self.characters}
 
             for scene in self.scenes:
-                output_path = self.destination_dir / f"{self.project_name}-scene-{scene.number}.mp4"
+                output_path = self.project_paths.scenes / f"{self.project_name}-scene-{scene.number}.mp4"
                 if output_path.exists():
                     try:
                         duration = probe_video_duration(output_path)
@@ -285,8 +320,9 @@ class ProjectGenerationWorker(video.VeniceVideoWorker):
                 self.progress.emit(0, "Estimated video generation cost: 0.0000 credits (all scene clips reused).")
 
             for scene in scenes_to_generate:
+                self.check_cancelled()
                 self.progress.emit(scene.number - 1, f"Preparing scene {scene.number} of {len(self.scenes)}...")
-                output_path = self.destination_dir / f"{self.project_name}-scene-{scene.number}.mp4"
+                output_path = self.project_paths.scenes / f"{self.project_name}-scene-{scene.number}.mp4"
                 selected = [
                     character_map[name]
                     for name in scene.character_names
@@ -312,11 +348,15 @@ class ProjectGenerationWorker(video.VeniceVideoWorker):
                     description=prompt,
                 )
                 self.reference_files = reference_paths if reference_urls else []
-                self.generate_video_segment(
-                    segment=segment,
-                    output_path=output_path,
-                    reference_data_urls=reference_urls,
-                )
+                self.billing_state.emit(True)
+                try:
+                    self.generate_video_segment(
+                        segment=segment,
+                        output_path=output_path,
+                        reference_data_urls=reference_urls,
+                    )
+                finally:
+                    self.billing_state.emit(False)
                 self.validate_media_file(output_path, f"scene {scene.number}")
                 duration = probe_video_duration(output_path)
                 if not scene_duration_matches(duration, scene.duration_seconds):
@@ -331,23 +371,146 @@ class ProjectGenerationWorker(video.VeniceVideoWorker):
             stitched = temp_dir / "stitched-scenes.mp4"
             self.progress.emit(len(self.scenes), "Stitching generated scenes...")
             ordered_segment_files = [segment_files[scene.number] for scene in self.scenes]
-            self.stitch_segments(ordered_segment_files, stitched)
+            self.stitch_segments(ordered_segment_files, stitched, self.cancel_event)
+            self.check_cancelled()
+            visual_input = stitched
+            audio_delay = 0
+            if self.title_image:
+                self.progress.emit(len(self.scenes), "Prepending the title card...")
+                visual_input = temp_dir / "title-and-scenes.mp4"
+                prepend_title_card(
+                    stitched,
+                    self.title_image,
+                    visual_input,
+                    self.title_duration,
+                    self.cancel_event,
+                )
+                audio_delay = self.title_duration
+            else:
+                self.progress.emit(len(self.scenes), "Normalizing the final video to 1920x1080...")
+                visual_input = temp_dir / "normalized-scenes.mp4"
+                normalize_video_1080p(stitched, visual_input, self.cancel_event)
             self.progress.emit(len(self.scenes), "Installing the project audio track...")
             mux_project_audio(
-                stitched,
+                visual_input,
                 self.output_file,
                 self.audio_path,
                 self.remove_generated_audio,
+                audio_delay_seconds=audio_delay,
+                cancel_event=self.cancel_event,
                 timeout=video.FFMPEG_STITCH_TIMEOUT_SECONDS,
             )
             self.validate_media_file(self.output_file, "final video")
-            self.finished.emit(str(self.output_file))
+            final_output = self.output_file
+            if self.burn_srt:
+                self.check_cancelled()
+                self.progress.emit(len(self.scenes), "Burning subtitles into the final video...")
+                captioned = self.project_paths.output / f"{self.project_name}-captioned.mp4"
+                burn_subtitles(
+                    self.output_file,
+                    self.srt_path,
+                    captioned,
+                    self.subtitle_font,
+                    self.subtitle_size,
+                    self.cancel_event,
+                )
+                final_output = captioned
+            self.finished.emit(str(final_output))
+        except (video.GenerationCancelled, OperationCancelled) as exc:
+            self.cancelled.emit(str(exc))
         except Exception as exc:
             self.failed.emit(f"{type(exc).__name__}: {exc}")
         finally:
+            self.billing_state.emit(False)
             self.session.close()
-            if temp_dir is not None:
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            self.project_paths.clean_temporary()
+
+
+class MusicPreparationWorker(QObject):
+    """Extract vocals and create a draft SRT without blocking the GUI."""
+
+    progress = Signal(str)
+    finished = Signal(str, str, str)
+    failed = Signal(str)
+    cancelled = Signal(str)
+
+    def __init__(
+        self,
+        mode,
+        audio_path,
+        vocal_path,
+        audio_directory,
+        temporary_directory,
+        srt_path,
+        lyrics,
+        whisper_model,
+        subtitle_offset,
+    ):
+        super().__init__()
+        self.mode = mode
+        self.audio_path = Path(audio_path)
+        self.vocal_path = Path(vocal_path) if vocal_path else None
+        self.audio_directory = Path(audio_directory)
+        self.temporary_directory = Path(temporary_directory)
+        self.srt_path = Path(srt_path)
+        self.lyrics = lyrics
+        self.whisper_model = whisper_model
+        self.subtitle_offset = float(subtitle_offset)
+        self.cancel_event = threading.Event()
+        self.active_process = None
+
+    def cancel(self):
+        self.cancel_event.set()
+        process = self.active_process
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+    def _set_process(self, process):
+        self.active_process = process
+
+    def run(self):
+        try:
+            vocals = self.vocal_path
+            if self.mode in {"vocals", "subtitles"} and (not vocals or not vocals.is_file()):
+                self.progress.emit("Separating the vocal stem with Demucs...")
+                temporary_vocals = extract_vocals(
+                    self.audio_path,
+                    self.temporary_directory,
+                    self.cancel_event,
+                    self._set_process,
+                )
+                vocals = copy_project_asset(
+                    temporary_vocals,
+                    self.audio_directory,
+                    f"{self.audio_path.stem}-vocals.wav",
+                )
+            if self.mode == "vocals":
+                self.finished.emit(str(vocals), "", "")
+                return
+
+            self.progress.emit(f"Transcribing vocals with faster-whisper ({self.whisper_model})...")
+            words = transcribe_words(vocals, self.whisper_model, self.cancel_event)
+            if self.lyrics.strip():
+                cues = align_lyrics_to_words(self.lyrics, words)
+                transcript = self.lyrics.strip()
+            else:
+                cues = cues_from_words(words)
+                transcript = "\n".join(cue.text for cue in cues)
+            if self.subtitle_offset:
+                cues = offset_cues(cues, self.subtitle_offset)
+            text = format_srt(cues)
+            self.srt_path.parent.mkdir(parents=True, exist_ok=True)
+            self.srt_path.write_text(text, encoding="utf-8")
+            self.finished.emit(str(vocals), str(self.srt_path), transcript)
+        except OperationCancelled as exc:
+            self.cancelled.emit(str(exc))
+        except Exception as exc:
+            if self.cancel_event.is_set():
+                self.cancelled.emit("Operation cancelled.")
+            else:
+                self.failed.emit(f"{type(exc).__name__}: {exc}")
+        finally:
+            shutil.rmtree(self.temporary_directory, ignore_errors=True)
 
 
 class CharacterDialog(QDialog):
@@ -417,6 +580,10 @@ class ProjectWindow(QMainWindow):
         self.model_worker = None
         self.cost_thread = None
         self.cost_worker = None
+        self.music_thread = None
+        self.music_worker = None
+        self.current_project_file = None
+        self.billed_generation_active = False
         self.audio_seconds = 0.0
         self.build_controls()
         self.build_layout()
@@ -503,21 +670,87 @@ class ProjectWindow(QMainWindow):
         self.estimate_button.clicked.connect(self.estimate_cost)
         self.generate_button = QPushButton("Start Generation")
         self.generate_button.clicked.connect(self.generate)
+        self.cancel_button = QPushButton("Cancel Generation")
+        self.cancel_button.clicked.connect(self.cancel_generation)
+        self.cancel_button.setEnabled(False)
+
+        self.title_image_edit = QLineEdit()
+        title_button = QPushButton("Browse...")
+        title_button.clicked.connect(self.choose_title_image)
+        self.title_image_row = QHBoxLayout()
+        self.title_image_row.addWidget(self.title_image_edit, 1)
+        self.title_image_row.addWidget(title_button)
+        self.title_duration_spin = QSpinBox()
+        self.title_duration_spin.setRange(5, 10)
+        self.title_duration_spin.setValue(5)
+        self.title_duration_spin.setSuffix(" seconds")
+
+        self.lyrics_edit = QTextEdit()
+        self.lyrics_edit.setPlaceholderText(
+            "Enter the actual sung lyrics, with one desired subtitle phrase per line."
+        )
+        self.srt_edit = QTextEdit()
+        self.srt_edit.setPlaceholderText("Generated or imported SRT can be reviewed and edited here.")
+        self.vocal_edit = QLineEdit()
+        self.vocal_edit.setReadOnly(True)
+        self.srt_path_edit = QLineEdit()
+        self.srt_path_edit.setReadOnly(True)
+        self.whisper_model_combo = QComboBox()
+        for model_name in ("tiny", "base", "small", "medium", "large-v3"):
+            self.whisper_model_combo.addItem(model_name)
+        self.whisper_model_combo.setCurrentText("small")
+        self.import_lyrics_button = QPushButton("Import Lyrics...")
+        self.import_lyrics_button.clicked.connect(self.import_lyrics)
+        self.import_srt_button = QPushButton("Import SRT...")
+        self.import_srt_button.clicked.connect(self.import_srt)
+        self.extract_vocals_button = QPushButton("Extract Vocals")
+        self.extract_vocals_button.clicked.connect(lambda: self.start_music_preparation("vocals"))
+        self.prepare_srt_button = QPushButton("Transcribe / Align SRT")
+        self.prepare_srt_button.clicked.connect(lambda: self.start_music_preparation("subtitles"))
+        self.export_srt_button = QPushButton("Export Edited SRT")
+        self.export_srt_button.clicked.connect(self.export_srt)
+
+        self.subtitle_font_combo = QFontComboBox()
+        self.subtitle_font_combo.setCurrentFont(self.subtitle_font_combo.font())
+        self.subtitle_size_spin = QSpinBox()
+        self.subtitle_size_spin.setRange(8, 144)
+        self.subtitle_size_spin.setValue(22)
+        self.burn_subtitles_checkbox = QCheckBox("Burn approved subtitles into a captioned final MP4")
+        self.preview_button = QPushButton("Preview Selected Scene")
+        self.preview_button.clicked.connect(self.preview_selected_scene)
+        self.preview_video = QVideoWidget()
+        self.preview_video.setMinimumHeight(220)
+        self.preview_audio = QAudioOutput(self)
+        self.preview_player = QMediaPlayer(self)
+        self.preview_player.setAudioOutput(self.preview_audio)
+        self.preview_player.setVideoOutput(self.preview_video)
 
     def build_layout(self):
+        self.tabs = QTabWidget()
+
+        project_tab = QWidget()
         project_form = QFormLayout()
         project_form.addRow("Project name", self.project_name_edit)
-        project_form.addRow("Output directory", self.output_row)
+        project_form.addRow("Project directory", self.output_row)
         project_form.addRow("Soundtrack", self.audio_row)
         project_form.addRow("Audio duration", self.audio_info)
         project_form.addRow("", self.remove_audio_checkbox)
         project_form.addRow("30-second model", self.model_row)
+        project_layout = QVBoxLayout(project_tab)
+        project_layout.addLayout(project_form)
+        project_layout.addWidget(QLabel("Overall video style (prepended to every scene prompt)"))
+        project_layout.addWidget(self.style_edit)
+        project_layout.addStretch(1)
+        self.tabs.addTab(project_tab, "Project")
 
+        scenes_tab = QWidget()
         scene_left = QWidget()
         scene_left_layout = QVBoxLayout(scene_left)
         scene_left_layout.addWidget(QLabel("Scene queue"))
         scene_left_layout.addWidget(self.scene_list, 1)
         scene_left_layout.addLayout(self.scene_buttons)
+        scene_left_layout.addWidget(self.preview_button)
+        scene_left_layout.addWidget(self.preview_video, 1)
         scene_right = QWidget()
         scene_right_layout = QVBoxLayout(scene_right)
         scene_right_layout.addWidget(QLabel("Selected scene duration"))
@@ -542,6 +775,63 @@ class ProjectWindow(QMainWindow):
         content_splitter.addWidget(character_widget)
         content_splitter.setStretchFactor(0, 3)
         content_splitter.setStretchFactor(1, 1)
+        scenes_layout = QVBoxLayout(scenes_tab)
+        scenes_layout.addWidget(content_splitter)
+        self.tabs.addTab(scenes_tab, "Scenes & Characters")
+
+        music_tab = QWidget()
+        music_layout = QVBoxLayout(music_tab)
+        music_actions = QHBoxLayout()
+        music_actions.addWidget(self.import_lyrics_button)
+        music_actions.addWidget(self.extract_vocals_button)
+        music_actions.addWidget(self.prepare_srt_button)
+        music_actions.addWidget(self.import_srt_button)
+        music_actions.addWidget(self.export_srt_button)
+        music_actions.addStretch(1)
+        music_layout.addLayout(music_actions)
+        music_form = QFormLayout()
+        music_form.addRow("Whisper model", self.whisper_model_combo)
+        music_form.addRow("Vocal stem", self.vocal_edit)
+        music_form.addRow("SRT file", self.srt_path_edit)
+        music_layout.addLayout(music_form)
+        lyric_splitter = QSplitter(Qt.Horizontal)
+        lyrics_widget = QWidget()
+        lyrics_layout = QVBoxLayout(lyrics_widget)
+        lyrics_layout.addWidget(QLabel("Authoritative lyrics (one cue per line)"))
+        lyrics_layout.addWidget(self.lyrics_edit)
+        srt_widget = QWidget()
+        srt_layout = QVBoxLayout(srt_widget)
+        srt_layout.addWidget(QLabel("Editable SRT"))
+        srt_layout.addWidget(self.srt_edit)
+        lyric_splitter.addWidget(lyrics_widget)
+        lyric_splitter.addWidget(srt_widget)
+        music_layout.addWidget(lyric_splitter, 1)
+        self.tabs.addTab(music_tab, "Music & Subtitles")
+
+        render_tab = QWidget()
+        render_layout = QVBoxLayout(render_tab)
+        render_form = QFormLayout()
+        render_form.addRow("Still title image (optional)", self.title_image_row)
+        render_form.addRow("Title duration", self.title_duration_spin)
+        render_form.addRow("Subtitle font", self.subtitle_font_combo)
+        render_form.addRow("Subtitle size", self.subtitle_size_spin)
+        render_form.addRow("", self.burn_subtitles_checkbox)
+        render_layout.addLayout(render_form)
+        render_layout.addWidget(
+            QLabel(
+                "The title card is prepended before the song. The original soundtrack is delayed by the title duration, "
+                "and generated SRT timing includes that offset."
+            )
+        )
+        render_layout.addStretch(1)
+        self.tabs.addTab(render_tab, "Render")
+
+        status_tab = QWidget()
+        status_layout = QVBoxLayout(status_tab)
+        status_layout.addWidget(QLabel("Status log"))
+        status_layout.addWidget(self.log, 1)
+        status_layout.addWidget(self.progress)
+        self.tabs.addTab(status_tab, "Status")
 
         actions = QHBoxLayout()
         actions.addWidget(self.load_button)
@@ -549,14 +839,9 @@ class ProjectWindow(QMainWindow):
         actions.addStretch(1)
         actions.addWidget(self.estimate_button)
         actions.addWidget(self.generate_button)
+        actions.addWidget(self.cancel_button)
         layout = QVBoxLayout()
-        layout.addLayout(project_form)
-        layout.addWidget(QLabel("Overall video style (prepended to every scene prompt)"))
-        layout.addWidget(self.style_edit)
-        layout.addWidget(content_splitter, 3)
-        layout.addWidget(QLabel("Status log"))
-        layout.addWidget(self.log, 1)
-        layout.addWidget(self.progress)
+        layout.addWidget(self.tabs, 1)
         layout.addLayout(actions)
         central = QWidget()
         central.setLayout(layout)
@@ -593,7 +878,12 @@ class ProjectWindow(QMainWindow):
             self.output_dir_edit.setText(path)
 
     def choose_audio(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Choose MP3 Soundtrack", self.audio_edit.text(), "MP3 audio (*.mp3)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose Soundtrack",
+            self.audio_edit.text(),
+            "Audio (*.mp3 *.wav *.flac *.m4a *.aac)",
+        )
         if not path:
             return
         try:
@@ -604,6 +894,178 @@ class ProjectWindow(QMainWindow):
         self.audio_edit.setText(path)
         self.audio_info.setText(f"{self.audio_seconds:.2f} seconds")
         self.rebuild_from_audio()
+
+    def project_paths(self, create=False):
+        root_text = self.output_dir_edit.text().strip()
+        if not root_text:
+            raise ValueError("Choose a project directory.")
+        paths = ProjectPaths(Path(root_text).expanduser().resolve())
+        return paths.create() if create else paths
+
+    def prepare_project_assets(self):
+        """Copy selected external resources into the canonical project layout."""
+        paths = self.project_paths(create=True)
+        audio_text = self.audio_edit.text().strip()
+        if audio_text:
+            audio = copy_project_asset(audio_text, paths.audio)
+            self.audio_edit.setText(str(audio))
+        title_text = self.title_image_edit.text().strip()
+        if title_text:
+            title = copy_project_asset(title_text, paths.images, "title" + Path(title_text).suffix.lower())
+            self.title_image_edit.setText(str(title))
+        lyrics = self.lyrics_edit.toPlainText().strip()
+        if lyrics:
+            (paths.audio / "lyrics.txt").write_text(lyrics + "\n", encoding="utf-8")
+        return paths
+
+    def choose_title_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose Still Title Image",
+            self.title_image_edit.text(),
+            "Images (*.png *.jpg *.jpeg *.webp)",
+        )
+        if path:
+            self.title_image_edit.setText(path)
+
+    def import_lyrics(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Lyrics", self.output_dir_edit.text(), "Text files (*.txt);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            self.lyrics_edit.setPlainText(Path(path).read_text(encoding="utf-8"))
+        except Exception as exc:
+            QMessageBox.critical(self, "Could not import lyrics", str(exc))
+
+    def import_srt(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import SRT", self.output_dir_edit.text(), "SubRip subtitles (*.srt)"
+        )
+        if not path:
+            return
+        try:
+            text = Path(path).read_text(encoding="utf-8-sig")
+            cues = parse_srt(text)
+            validate_cues(cues)
+            paths = self.prepare_project_assets()
+            destination = paths.output / f"{project_slug(self.project_name_edit.text())}.srt"
+            destination.write_text(format_srt(cues), encoding="utf-8")
+            self.srt_path_edit.setText(str(destination))
+            self.srt_edit.setPlainText(format_srt(cues))
+        except Exception as exc:
+            QMessageBox.critical(self, "Could not import SRT", str(exc))
+
+    def export_srt(self):
+        try:
+            cues = parse_srt(self.srt_edit.toPlainText())
+            if not cues:
+                raise ValueError("There are no subtitle cues to export.")
+            maximum = self.audio_seconds + (
+                self.title_duration_spin.value() if self.title_image_edit.text().strip() else 0
+            )
+            validate_cues(cues, maximum or None)
+            paths = self.prepare_project_assets()
+            default = paths.output / f"{project_slug(self.project_name_edit.text())}.srt"
+        except Exception as exc:
+            QMessageBox.warning(self, "Cannot export SRT", str(exc))
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export SRT", str(default), "SubRip subtitles (*.srt)")
+        if path:
+            Path(path).write_text(format_srt(cues), encoding="utf-8")
+            self.srt_path_edit.setText(str(Path(path).resolve()))
+            self.append_log(f"Exported subtitles: {path}")
+
+    def preview_selected_scene(self):
+        row = self.scene_list.currentRow()
+        if row < 0 or row >= len(self.scenes):
+            QMessageBox.information(self, "No scene selected", "Select a scene to preview.")
+            return
+        try:
+            slug = project_slug(self.project_name_edit.text())
+            paths = self.project_paths()
+        except Exception as exc:
+            QMessageBox.warning(self, "Cannot preview", str(exc))
+            return
+        candidates = [
+            paths.scenes / f"{slug}-scene-{self.scenes[row].number}.mp4",
+            paths.root / f"{slug}-scene-{self.scenes[row].number}.mp4",
+        ]
+        clip = next((path for path in candidates if path.is_file()), None)
+        if clip is None:
+            QMessageBox.information(self, "No clip", "This scene does not have an existing video clip.")
+            return
+        self.preview_player.setSource(QUrl.fromLocalFile(str(clip)))
+        self.preview_player.play()
+
+    def start_music_preparation(self, mode):
+        if self.music_thread is not None or self.thread is not None:
+            return
+        try:
+            paths = self.prepare_project_assets()
+            slug = project_slug(self.project_name_edit.text())
+            audio_path = Path(self.audio_edit.text())
+            if not audio_path.is_file():
+                raise FileNotFoundError("Choose a valid soundtrack first.")
+            vocal_path = self.vocal_edit.text().strip()
+            srt_path = paths.output / f"{slug}.srt"
+        except Exception as exc:
+            QMessageBox.warning(self, "Cannot prepare music", str(exc))
+            return
+        self.music_thread = QThread(self)
+        self.music_worker = MusicPreparationWorker(
+            mode,
+            audio_path,
+            vocal_path,
+            paths.audio,
+            paths.temporary,
+            srt_path,
+            self.lyrics_edit.toPlainText(),
+            self.whisper_model_combo.currentText(),
+            self.title_duration_spin.value() if self.title_image_edit.text().strip() else 0,
+        )
+        self.music_worker.moveToThread(self.music_thread)
+        self.music_thread.started.connect(self.music_worker.run)
+        self.music_worker.progress.connect(self.append_log)
+        self.music_worker.finished.connect(self.music_preparation_finished)
+        self.music_worker.failed.connect(self.music_preparation_failed)
+        self.music_worker.cancelled.connect(self.music_preparation_cancelled)
+        self.music_worker.finished.connect(self.music_thread.quit)
+        self.music_worker.failed.connect(self.music_thread.quit)
+        self.music_worker.cancelled.connect(self.music_thread.quit)
+        self.music_thread.finished.connect(self.clear_music_worker)
+        self.set_generating(True)
+        self.tabs.setCurrentWidget(self.tabs.widget(4))
+        self.append_log("Starting vocal preparation..." if mode == "vocals" else "Starting subtitle preparation...")
+        self.music_thread.start()
+
+    def music_preparation_finished(self, vocal_path, srt_path, transcript):
+        self.vocal_edit.setText(vocal_path)
+        if transcript and not self.lyrics_edit.toPlainText().strip():
+            self.lyrics_edit.setPlainText(transcript)
+        if srt_path:
+            self.srt_path_edit.setText(srt_path)
+            self.srt_edit.setPlainText(Path(srt_path).read_text(encoding="utf-8"))
+            self.append_log(f"Created subtitles: {srt_path}")
+        else:
+            self.append_log(f"Created vocal stem: {vocal_path}")
+
+    def music_preparation_failed(self, message):
+        self.append_log("FAILED: " + message)
+        QMessageBox.critical(self, "Music preparation failed", message)
+
+    def music_preparation_cancelled(self, message):
+        self.append_log(message)
+
+    def clear_music_worker(self):
+        if self.music_worker:
+            self.music_worker.deleteLater()
+        if self.music_thread:
+            self.music_thread.deleteLater()
+        self.music_worker = None
+        self.music_thread = None
+        self.set_generating(False)
 
     def add_scene(self, duration, prompt="", character_names=None):
         self.commit_scene_editor()
@@ -688,7 +1150,11 @@ class ProjectWindow(QMainWindow):
             return list(self.scenes)
         output_dir = Path(output_text)
         for scene in self.scenes:
-            path = output_dir / f"{slug}-scene-{scene.number}.mp4"
+            candidates = [
+                output_dir / "video" / "scenes" / f"{slug}-scene-{scene.number}.mp4",
+                output_dir / f"{slug}-scene-{scene.number}.mp4",
+            ]
+            path = next((item for item in candidates if item.is_file()), candidates[0])
             if not path.is_file():
                 missing.append(scene)
                 continue
@@ -863,28 +1329,49 @@ class ProjectWindow(QMainWindow):
         self.commit_scene_editor()
         model_data = self.model_combo.currentData()
         model_id = model_data[0].model_id if model_data else self.model_combo.currentText()
+        root = Path(self.output_dir_edit.text()).expanduser().resolve()
+
         return {
-            "version": 1,
+            "version": 2,
             "project_name": self.project_name_edit.text().strip(),
-            "output_directory": self.output_dir_edit.text().strip(),
-            "audio_path": self.audio_edit.text().strip(),
+            "output_directory": str(root),
+            "audio_path": stored_project_path(self.audio_edit.text(), root),
             "audio_seconds": self.audio_seconds,
             "remove_generated_audio": self.remove_audio_checkbox.isChecked(),
             "video_model": model_id,
             "overall_style": self.style_edit.toPlainText(),
             "scenes": [asdict(scene) for scene in self.scenes],
+            "music_video": {
+                "lyrics_text": self.lyrics_edit.toPlainText(),
+                "lyrics_path": "audio/lyrics.txt" if self.lyrics_edit.toPlainText().strip() else "",
+                "vocals_path": stored_project_path(self.vocal_edit.text(), root),
+                "srt_path": stored_project_path(self.srt_path_edit.text(), root),
+                "whisper_model": self.whisper_model_combo.currentText(),
+                "subtitle_enabled": self.burn_subtitles_checkbox.isChecked(),
+                "subtitle_style": {
+                    "font_name": self.subtitle_font_combo.currentFont().family(),
+                    "font_size": self.subtitle_size_spin.value(),
+                },
+                "title_image_path": stored_project_path(self.title_image_edit.text(), root),
+                "title_duration_seconds": self.title_duration_spin.value(),
+            },
         }
 
     def save_project_dialog(self):
         try:
             slug = project_slug(self.project_name_edit.text())
+            paths = self.prepare_project_assets()
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid project name", str(exc))
             return
-        default = Path(self.output_dir_edit.text() or ".") / f"{slug}.venice-video-project.json"
+        except Exception as exc:
+            QMessageBox.warning(self, "Cannot save project", str(exc))
+            return
+        default = paths.root / f"{slug}.venice-video-project.json"
         path, _ = QFileDialog.getSaveFileName(self, "Save Video Project", str(default), "Video project (*.json)")
         if path:
             save_project(path, self.project_payload())
+            self.current_project_file = Path(path).resolve()
             self.append_log(f"Saved project: {path}")
 
     def load_project_dialog(self):
@@ -892,20 +1379,57 @@ class ProjectWindow(QMainWindow):
         if not path:
             return
         try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            project_file = Path(path).resolve()
+            data = json.loads(project_file.read_text(encoding="utf-8"))
             scenes = [Scene.from_dict(item) for item in data.get("scenes", [])]
             if not scenes:
                 raise ValueError("The project contains no scenes.")
         except Exception as exc:
             QMessageBox.critical(self, "Could not load project", str(exc))
             return
+        version = int(data.get("version", 1))
+        root_value = str(data.get("output_directory", "")).strip()
+        root = Path(root_value).expanduser() if root_value else project_file.parent
+        if not root.is_absolute():
+            root = project_file.parent / root
+        root = root.resolve()
+
+        def loaded_path(value):
+            return resolve_project_path(value, root, project_file, version)
+
+        self.current_project_file = project_file
         self.project_name_edit.setText(str(data.get("project_name", "")))
-        self.output_dir_edit.setText(str(data.get("output_directory", "")))
-        self.audio_edit.setText(str(data.get("audio_path", "")))
+        self.output_dir_edit.setText(str(root))
+        self.audio_edit.setText(loaded_path(data.get("audio_path", "")))
         self.audio_seconds = float(data.get("audio_seconds", 0))
         self.audio_info.setText(f"{self.audio_seconds:.2f} seconds" if self.audio_seconds else "No audio selected")
         self.remove_audio_checkbox.setChecked(bool(data.get("remove_generated_audio", True)))
         self.style_edit.setPlainText(str(data.get("overall_style", "")))
+        music = data.get("music_video", {}) if isinstance(data.get("music_video", {}), dict) else {}
+        self.lyrics_edit.setPlainText(str(music.get("lyrics_text", "")))
+        self.vocal_edit.setText(loaded_path(music.get("vocals_path", "")))
+        srt_path = loaded_path(music.get("srt_path", ""))
+        self.srt_path_edit.setText(srt_path)
+        self.srt_edit.clear()
+        if srt_path and Path(srt_path).is_file():
+            try:
+                self.srt_edit.setPlainText(Path(srt_path).read_text(encoding="utf-8-sig"))
+            except OSError as exc:
+                self.append_log(f"Could not read saved SRT: {exc}")
+        self.title_image_edit.setText(loaded_path(music.get("title_image_path", "")))
+        self.title_duration_spin.setValue(int(music.get("title_duration_seconds", 5)))
+        whisper = str(music.get("whisper_model", "small"))
+        if self.whisper_model_combo.findText(whisper) >= 0:
+            self.whisper_model_combo.setCurrentText(whisper)
+        self.burn_subtitles_checkbox.setChecked(bool(music.get("subtitle_enabled", False)))
+        subtitle_style = music.get("subtitle_style", {}) if isinstance(music.get("subtitle_style", {}), dict) else {}
+        font_name = str(subtitle_style.get("font_name", "DejaVu Sans"))
+        self.subtitle_font_combo.setCurrentFont(self.subtitle_font_combo.currentFont())
+        for index in range(self.subtitle_font_combo.count()):
+            if self.subtitle_font_combo.itemText(index) == font_name:
+                self.subtitle_font_combo.setCurrentIndex(index)
+                break
+        self.subtitle_size_spin.setValue(int(subtitle_style.get("font_size", 22)))
         self.scenes = scenes
         self.ready_scene_numbers.clear()
         for index, scene in enumerate(self.scenes, 1):
@@ -932,6 +1456,16 @@ class ProjectWindow(QMainWindow):
         audio_path = self.audio_edit.text().strip()
         if audio_path and not Path(audio_path).is_file():
             raise FileNotFoundError(f"The soundtrack does not exist:\n{audio_path}")
+        title_path = self.title_image_edit.text().strip()
+        if title_path and not Path(title_path).is_file():
+            raise FileNotFoundError(f"The title image does not exist:\n{title_path}")
+        if self.burn_subtitles_checkbox.isChecked():
+            srt_text = self.srt_edit.toPlainText().strip()
+            if not srt_text:
+                raise ValueError("Create or import subtitles before enabling subtitle burn-in.")
+            cues = parse_srt(srt_text)
+            media_duration = self.audio_seconds + (self.title_duration_spin.value() if title_path else 0)
+            validate_cues(cues, media_duration or None)
         if not self.scenes:
             raise ValueError("Add at least one scene to the queue.")
         generation_scenes = [
@@ -1063,14 +1597,22 @@ class ProjectWindow(QMainWindow):
     def generate(self):
         if self.thread is not None or self.cost_thread is not None or not self.ensure_api_key():
             return
-        self.scan_existing_scene_clips()
         try:
+            paths = self.prepare_project_assets()
+            self.scan_existing_scene_clips()
             slug, output_dir, audio_path, option, kind, selected_characters = self.validate_generation()
+            srt_path = ""
+            if self.srt_edit.toPlainText().strip():
+                cues = parse_srt(self.srt_edit.toPlainText())
+                srt_file = paths.output / f"{slug}.srt"
+                srt_file.write_text(format_srt(cues), encoding="utf-8")
+                self.srt_path_edit.setText(str(srt_file))
+                srt_path = str(srt_file)
         except Exception as exc:
             QMessageBox.warning(self, "Cannot start generation", str(exc))
             return
-        output_dir.mkdir(parents=True, exist_ok=True)
-        final_output = output_dir / f"{slug}.mp4"
+        paths.create()
+        final_output = paths.output / f"{slug}.mp4"
         if final_output.exists():
             accepted = QMessageBox.question(
                 self,
@@ -1083,7 +1625,9 @@ class ProjectWindow(QMainWindow):
             ) == QMessageBox.Yes
             if not accepted:
                 return
-        save_project(output_dir / f"{slug}.venice-video-project.json", self.project_payload())
+        project_file = paths.root / f"{slug}.venice-video-project.json"
+        save_project(project_file, self.project_payload())
+        self.current_project_file = project_file
         resolution = "1080p" if "1080p" in option.resolutions else (option.resolutions[0] if option.resolutions else None)
         aspect_ratio = "16:9" if "16:9" in option.aspect_ratios else (option.aspect_ratios[0] if option.aspect_ratios else None)
         self.log.clear()
@@ -1102,7 +1646,7 @@ class ProjectWindow(QMainWindow):
             list(self.scenes),
             list(self.characters),
             self.style_edit.toPlainText().strip(),
-            output_dir,
+            paths,
             slug,
             audio_path,
             self.remove_audio_checkbox.isChecked(),
@@ -1110,16 +1654,25 @@ class ProjectWindow(QMainWindow):
             kind,
             resolution,
             aspect_ratio,
+            self.title_image_edit.text().strip(),
+            self.title_duration_spin.value(),
+            srt_path,
+            self.burn_subtitles_checkbox.isChecked(),
+            self.subtitle_font_combo.currentFont().family(),
+            self.subtitle_size_spin.value(),
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.update_progress)
         self.worker.scene_ready.connect(self.scene_clip_ready)
+        self.worker.billing_state.connect(self.set_billing_state)
         self.worker.seedance_consent_required.connect(self.handle_consent)
         self.worker.finished.connect(self.generation_finished)
         self.worker.failed.connect(self.generation_failed)
+        self.worker.cancelled.connect(self.generation_cancelled)
         self.worker.finished.connect(self.thread.quit)
         self.worker.failed.connect(self.thread.quit)
+        self.worker.cancelled.connect(self.thread.quit)
         self.thread.finished.connect(self.clear_worker)
         self.thread.start()
 
@@ -1159,6 +1712,31 @@ class ProjectWindow(QMainWindow):
         self.append_log("FAILED: " + message)
         QMessageBox.critical(self, "Generation failed", message)
 
+    def generation_cancelled(self, message):
+        self.append_log(message or "Generation cancelled.")
+
+    def set_billing_state(self, active):
+        self.billed_generation_active = bool(active)
+
+    def cancel_generation(self):
+        worker = self.worker or self.music_worker
+        if worker is None:
+            return
+        if self.billed_generation_active:
+            accepted = QMessageBox.warning(
+                self,
+                "Cancel billed video generation?",
+                "A Venice video request is already in progress. Cancelling stops this application from "
+                "waiting or starting more scenes, but the active request may still be billed.\n\nCancel anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            ) == QMessageBox.Yes
+            if not accepted:
+                return
+        self.cancel_button.setEnabled(False)
+        self.append_log("Cancellation requested; stopping active work and cleaning temporary files...")
+        worker.cancel()
+
     def clear_worker(self):
         if self.worker:
             self.worker.deleteLater()
@@ -1166,13 +1744,18 @@ class ProjectWindow(QMainWindow):
             self.thread.deleteLater()
         self.worker = None
         self.thread = None
+        self.billed_generation_active = False
         self.set_generating(False)
 
     def set_generating(self, generating):
+        if generating:
+            self.preview_player.stop()
+        self.tabs.setDisabled(generating)
         self.generate_button.setDisabled(generating)
         self.estimate_button.setDisabled(generating)
         self.save_button.setDisabled(generating)
         self.load_button.setDisabled(generating)
+        self.cancel_button.setEnabled(generating)
 
     def append_log(self, message):
         self.log.append(str(message).replace("\n", "<br>"))

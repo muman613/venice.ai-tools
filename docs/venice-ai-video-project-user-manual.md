@@ -1,10 +1,10 @@
 # Venice AI Video Project Builder — User Manual
 
 `venice-ai-video-project.py` is a desktop application for making a multi-scene
-MP4 whose length follows an MP3 soundtrack. You write each scene yourself,
-reuse character descriptions and reference images, and generate the scenes with
-a current Venice video model. The application then joins the clips and installs
-the final audio track.
+music video whose length follows a soundtrack. It can isolate vocals, transcribe
+or align user-supplied lyrics, export SRT subtitles, prepend a still title card,
+generate or reuse Venice scenes, and optionally burn styled subtitles into a
+1920×1080 final render while retaining the original song mix.
 
 The tool is best suited to music videos, narrated visual sequences, trailers,
 and other projects that can be designed as independent 10-, 15-, or 30-second
@@ -21,6 +21,8 @@ Before starting, you need:
 - A Venice API key with access to video generation.
 - A graphical desktop environment supported by PySide6.
 - Enough Venice balance for every scene in the project.
+- Optional Demucs and faster-whisper packages for vocal isolation and automatic
+  subtitle timing. Manual SRT import/edit/export does not require them.
 
 From the repository root, a typical setup is:
 
@@ -28,6 +30,7 @@ From the repository root, a typical setup is:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+pip install -r requirements-music-video.txt  # optional music preprocessing
 sudo apt install ffmpeg             # Ubuntu or Debian
 export VENICE_API_KEY="your-api-key"
 ```
@@ -50,22 +53,14 @@ models. Only text-to-video and reference-to-video models that advertise
 30-second generation are shown. Select **Refresh Models** to load the list
 again or to enter an API key.
 
-The window is divided into six working areas:
-
-1. Project settings: name, output directory, soundtrack, audio mode, and model.
-2. Overall video style: instructions automatically added to every scene.
-3. Scene queue: the ordered clips that make up the video.
-4. Scene editor: duration, prompt, and character selection for the current
-   scene.
-5. Character library: reusable character records shared by all projects.
-6. Status log and progress bar: cost estimate, queue activity, generated files,
-   and errors.
+The window is divided into five tabs: **Project**, **Scenes & Characters**,
+**Music & Subtitles**, **Render**, and **Status**.
 
 ## 3. Quick-start workflow
 
 1. Enter a short **Project name**, such as `tides-of-hate`.
-2. Choose an **Output directory**.
-3. Select **Choose MP3...** and open the soundtrack. The scene queue is rebuilt
+2. Choose a dedicated **Project directory**.
+3. Select **Choose Soundtrack...** and open the soundtrack. The scene queue is rebuilt
    to cover its duration.
 4. Select a model. Use a reference-to-video model if you want to upload
    character images; use a text-to-video model if descriptions are sufficient.
@@ -73,10 +68,14 @@ The window is divided into six working areas:
 6. Create any recurring characters in the character library.
 7. Work through the scene queue. Write a prompt for every scene and check the
    characters that appear in it.
-8. Review the audio option and select **Estimate Cost** to retrieve a live quote
+8. In **Music & Subtitles**, enter/import the actual sung lyrics. Select
+   **Extract Vocals**, then **Transcribe / Align SRT**, and review the editable SRT.
+9. In **Render**, optionally select a title image and its 5–10 second duration,
+   then choose subtitle font, size, and whether to burn captions.
+10. Review the audio option and select **Estimate Cost** to retrieve a live quote
    without generating any video.
-9. Save the editable project and select **Start Generation**.
-10. Watch the status log. When generation finishes, the application reports the
+11. Save the editable project and select **Start Generation**.
+12. Watch the status log. When generation finishes, the application reports the
    path of the completed MP4.
 
 Generation can take a long time because scenes are submitted and completed one
@@ -90,15 +89,21 @@ The project name becomes the filename prefix. Spaces and unsafe filename
 characters are converted to hyphens when generation begins. For example,
 `Tides of Hate!` becomes `Tides-of-Hate`.
 
-For a project whose resulting prefix is `tides-of-hate`, the output directory
+For a project whose resulting prefix is `tides-of-hate`, the project directory
 contains:
 
 ```text
 tides-of-hate.venice-video-project.json
-tides-of-hate-scene-1.mp4
-tides-of-hate-scene-2.mp4
-...
-tides-of-hate.mp4
+audio/song.mp3
+audio/song-vocals.wav
+audio/lyrics.txt
+images/title.png
+video/scenes/tides-of-hate-scene-1.mp4
+video/scenes/tides-of-hate-scene-2.mp4
+video/output/tides-of-hate.srt
+video/output/tides-of-hate.mp4
+video/output/tides-of-hate-captioned.mp4
+tmp/                                  # removed after each run
 ```
 
 Scene MP4s are retained after a successful build. If any of these video files
@@ -255,11 +260,32 @@ The current generator deliberately does not request audio in the Venice scene
 payload because audio support varies by model. Consequently, mixing has an
 effect only when the returned clips actually contain audio.
 
+### Vocal isolation and subtitle timing
+
+In **Music & Subtitles**, enter the actual sung lyrics with one intended cue per
+line, or leave the editor empty to use speech-to-text wording as a draft.
+**Extract Vocals** runs Demucs locally and retains `audio/<song>-vocals.wav`.
+**Transcribe / Align SRT** runs faster-whisper on that stem. When lyrics were
+entered, their text remains authoritative and only the word timestamps are used
+for timing. Review every cue, especially repeated choruses and instrumental
+breaks. Use **Import SRT** or **Export Edited SRT** for a fully manual workflow.
+
+The isolated vocal is never used as final program audio. Rendering always uses
+the original imported song. When a title card is selected, automatic SRT cues
+are offset by its duration because the title precedes the song.
+
+In **Render**, select an installed font and size. Subtitle burn-in requires an
+FFmpeg build with the libass `subtitles` filter. The uncaptioned MP4 and sidecar
+SRT remain available even when a captioned MP4 is produced.
+
 ## 8. Save and load editable projects
 
 Select **Save Project** to write a JSON project document. It records the project
-name, output directory, soundtrack path and measured duration, audio choice,
-selected model ID, overall style, and all scene data.
+name, project directory, soundtrack path and measured duration, audio choice,
+selected model ID, overall style, all scene data, lyrics and processing paths,
+title-card settings, and subtitle font/size. Version-2 resource paths inside the
+project are saved relative to the project root. Existing version-1 JSON files
+continue to load and are upgraded when next saved.
 
 Select **Load Project** to restore those fields. Character definitions are not
 embedded in the project; loaded scenes resolve character names against the
@@ -324,16 +350,21 @@ The application then processes each scene in order:
    scene prompt.
 3. Upload applicable reference images as data URLs.
 4. Queue the scene with Venice and poll until it completes.
-5. Download and validate the scene MP4 in the output directory.
+5. Download and validate the scene MP4 in `video/scenes`.
 6. Join all scene files with FFmpeg.
-7. Replace, mix, retain, or remove audio according to the selected audio mode.
-8. Validate and save the final project MP4.
+7. Prepend the selected still title card and delay the original soundtrack by
+   the same 5–10 second duration.
+8. Replace, mix, retain, or remove audio according to the selected audio mode.
+9. Optionally burn the approved SRT with the selected font and size.
+10. Validate and save outputs in `video/output`.
 
 The progress bar counts completed scenes. The status log shows the model,
-duration plan, estimate, queue progress, and paths of completed files. There is
-no cancel or resume control. If generation fails, successfully downloaded scene
-files remain. A later run reuses each valid, correctly timed scene file and
-regenerates only missing, unreadable, non-video, or incorrectly timed scenes.
+duration plan, estimate, queue progress, and paths of completed files. While a
+worker is active, all controls except **Cancel Generation** are disabled.
+Cancellation stops remaining work and removes `tmp`. If a billed Venice request
+has already been queued, the confirmation dialog warns that stopping locally
+may not prevent that request from being billed. Successfully downloaded scene
+files remain reusable after cancellation or failure.
 
 ### Face-media consent
 

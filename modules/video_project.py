@@ -10,6 +10,8 @@ import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from modules.music_video import run_cancellable
+
 
 APP_DATA_DIR = Path.home() / ".local" / "share" / "venice-ai-video"
 CHARACTERS_PATH = APP_DATA_DIR / "characters.json"
@@ -237,6 +239,8 @@ def mux_project_audio(
     output_video,
     audio_path="",
     remove_generated_audio=True,
+    audio_delay_seconds=0,
+    cancel_event=None,
     timeout=1800,
 ):
     """Create the final MP4, replacing or mixing audio and forcing stereo."""
@@ -250,22 +254,40 @@ def mux_project_audio(
     command = [ffmpeg, "-nostdin", "-y", "-i", str(input_video)]
     if audio_path:
         audio_seconds = probe_audio_duration(audio_path)
+        audio_delay_seconds = max(0.0, float(audio_delay_seconds))
+        output_seconds = audio_seconds + audio_delay_seconds
         command.extend(["-i", str(audio_path)])
         if remove_generated_audio or not media_has_audio(input_video):
+            if audio_delay_seconds:
+                delay_ms = round(audio_delay_seconds * 1000)
+                command.extend(
+                    [
+                        "-filter_complex", f"[1:a:0]adelay={delay_ms}:all=1[audio]",
+                        "-map", "0:v:0", "-map", "[audio]",
+                    ]
+                )
+            else:
+                command.extend(["-map", "0:v:0", "-map", "1:a:0"])
             command.extend(
                 [
-                    "-map", "0:v:0", "-map", "1:a:0",
                     "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                     "-pix_fmt", "yuv420p",
                     "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-shortest",
                 ]
             )
         else:
+            music_filter = "[1:a:0]aformat=channel_layouts=stereo[music]"
+            if audio_delay_seconds:
+                delay_ms = round(audio_delay_seconds * 1000)
+                music_filter = (
+                    "[1:a:0]aformat=channel_layouts=stereo,"
+                    f"adelay={delay_ms}:all=1[music]"
+                )
             command.extend(
                 [
                     "-filter_complex",
                     "[0:a:0]aformat=channel_layouts=stereo[clip];"
-                    "[1:a:0]aformat=channel_layouts=stereo[music];"
+                    + music_filter + ";"
                     "[clip][music]amix=inputs=2:duration=shortest:normalize=0[mix]",
                     "-map", "0:v:0", "-map", "[mix]",
                     "-c:v", "libx264", "-preset", "medium", "-crf", "18",
@@ -273,24 +295,33 @@ def mux_project_audio(
                     "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-shortest",
                 ]
             )
-        command.extend(["-t", f"{audio_seconds:.6f}"])
+        command.extend(["-t", f"{output_seconds:.6f}"])
     elif remove_generated_audio:
         command.extend(["-map", "0:v:0", "-c:v", "copy", "-an"])
     else:
         command.extend(["-map", "0:v:0", "-map", "0:a?", "-c", "copy"])
     command.extend(["-movflags", "+faststart", str(output_video)])
 
-    result = subprocess.run(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-    )
-    if result.returncode != 0 or not output_video.exists() or output_video.stat().st_size == 0:
+    if cancel_event is not None:
+        try:
+            run_cancellable(command, cancel_event)
+        except Exception:
+            output_video.unlink(missing_ok=True)
+            raise
+        result = None
+    else:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+    if (result is not None and result.returncode != 0) or not output_video.exists() or output_video.stat().st_size == 0:
         output_video.unlink(missing_ok=True)
-        raise RuntimeError(f"FFmpeg could not create the final audio mix.\n\n{result.stderr[-6000:]}")
+        stderr = result.stderr[-6000:] if result is not None else ""
+        raise RuntimeError(f"FFmpeg could not create the final audio mix.\n\n{stderr}")
 
 
 def media_has_audio(path):

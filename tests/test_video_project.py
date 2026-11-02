@@ -11,6 +11,7 @@ from modules.video_project import (
     Scene,
     build_scene_prompt,
     load_characters,
+    mux_project_audio,
     plan_scene_durations,
     probe_video_duration,
     project_slug,
@@ -85,6 +86,27 @@ class VideoProjectTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "no video stream"):
                 probe_video_duration(path)
+
+    @patch("modules.video_project.media_has_audio", return_value=False)
+    @patch("modules.video_project.probe_audio_duration", return_value=120.0)
+    @patch("modules.video_project.subprocess.run")
+    @patch("modules.video_project.shutil.which", return_value="/usr/bin/ffmpeg")
+    def test_mux_can_delay_original_audio_for_title_card(self, _which, run, _duration, _has_audio):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.mp4"
+            audio_path = Path(directory) / "song.mp3"
+            output_path = Path(directory) / "output.mp4"
+            input_path.touch()
+            audio_path.touch()
+            def complete(_command, **_kwargs):
+                output_path.write_bytes(b"created")
+                return SimpleNamespace(returncode=0, stderr="")
+
+            run.side_effect = complete
+            mux_project_audio(input_path, output_path, audio_path, True, audio_delay_seconds=7)
+            command = run.call_args.args[0]
+            self.assertIn("[1:a:0]adelay=7000:all=1[audio]", command)
+            self.assertIn("127.000000", command)
 
 
 if __name__ == "__main__":
