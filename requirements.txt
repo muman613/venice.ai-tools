@@ -3,3 +3,5 @@ requests>=2.32
 ffmpeg-python>=0.2
 Markdown>=3.6
 beautifulsoup4>=4.12
+demucs>=4.0
+faster-whisper>=1.0

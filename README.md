@@ -13,7 +13,7 @@ The repository is available on GitHub at [muman613/venice.ai-tools](https://gith
 | Story Writer | `venice-ai-story-writer.py` | Write and revise long-form Markdown with Venice chat models. |
 | Image Generator | `venice-ai-image.py` | Generate image variants with model-aware dimensions, styles, and parameters. |
 | Video Generator | `venice-ai-video.py` | Build variable-length image-to-video or text-to-video projects from sequential clips. |
-| Video Project Builder | `venice-ai-video-project.py` | Author audio-length, multi-scene videos with reusable character references and 30-second clips. |
+| Video Project Builder | `venice-ai-video-project.py` | Build music videos with reusable scenes, vocal isolation, lyric SRT timing, title cards, previews, and captioned renders. |
 | Classic Video Generator | `venice-ai-video-classic.py` | Build a fixed one-minute video from four Wan 2.7 image-to-video clips. |
 | Text to Speech | `venice-ai-tts.py` | Queue TXT and HTML documents for conversion to MP3. |
 | Model Listing Helper | `list-models.py` | Print model metadata matching Wan 2.7 from the Venice models endpoint. |
@@ -171,16 +171,22 @@ python venice-ai-video-project.py
 For complete setup, authoring, generation, file-management, and troubleshooting
 instructions, see the [Video Project Builder user manual](docs/venice-ai-video-project-user-manual.md).
 
+Vocal isolation and local speech-to-text are optional. Install their additional
+dependencies with `pip install -r requirements-music-video.txt`. Manual SRT
+import, editing, and export remain available without those packages.
+
 This application is intended for longer videos authored as individual cut-scenes:
 
-1. Enter a project name and output directory.
-2. Select an MP3 soundtrack. FFprobe reads its duration and creates a queue of 30-second scenes. The final scene is rounded up to 10, 15, or 30 seconds, and the completed video is trimmed to the soundtrack.
+1. Enter a project name and choose a dedicated project directory.
+2. Select a soundtrack. FFprobe reads its duration and creates a queue of 30-second scenes. The final scene is rounded up to 10, 15, or 30 seconds, and the completed video is trimmed to the soundtrack.
 3. Enter the overall visual style. It is prepended to every scene prompt.
 4. Create reusable characters with a name, text description, and optional reference image. Characters are stored in `~/.local/share/venice-ai-video/characters.json` and can be inspected, renamed, edited, or deleted.
 5. Select each queued scene, write its prompt, and check the characters appearing in it.
 6. Choose a live model that advertises 30-second generation. Reference-to-video models receive the checked character images; text-to-video models receive their descriptions.
 7. Select **Estimate Cost** to retrieve and display a live quote in Venice credits without queueing any video jobs.
-8. Select **Start Generation**. Scene files are saved as `<project>-scene-1.mp4`, `<project>-scene-2.mp4`, and so on, then stitched into `<project>.mp4`. On later runs, existing scene files with a video stream and the expected duration are reused; invalid or incorrectly timed scenes are regenerated.
+8. Enter/import lyrics, optionally isolate vocals with Demucs, create a timed SRT with faster-whisper, and review it in the editor.
+9. Optionally choose a 5–10 second still title card plus the subtitle font and size.
+10. Select **Start Generation**. Reusable clips are stored in `video/scenes`; uncaptioned, captioned, and SRT outputs are stored in `video/output`. On later runs, existing valid scenes are reused.
 
 By default, all model-generated audio is removed and the MP3 is encoded as the final stereo AAC track. Clear the audio-removal checkbox to mix model-generated audio with the MP3 instead. The editable project is automatically saved beside the output as `<project>.venice-video-project.json`; it can also be saved or loaded manually.
 
